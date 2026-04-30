@@ -29,6 +29,13 @@ FETCH_TIMEOUT = 20
 HIT_SENTENCE_COL = "Hit Sentence"
 DOMAIN_MIN_DELAY = 5.0
 
+MELTWATER_DOMAINS = {
+    "transition.meltwater.com",
+    "app.meltwater.com",
+    "meltwater.com",
+}
+MELTWATER_LOGIN_URL = "https://app.meltwater.com/"
+
 BEDROCK_REGION = st.secrets.get("BEDROCK_REGION", os.environ.get("BEDROCK_REGION", "us-east-2"))
 BEDROCK_MODEL_ID = st.secrets.get(
     "BEDROCK_MODEL_ID",
@@ -204,11 +211,179 @@ def fetch_via_playwright(url: str) -> str | None:
         return None
 
 
-def fetch_and_extract(url: str, hit_sentence: str = "") -> str:
+def is_meltwater_url(url: str) -> bool:
+    """Return True if this URL belongs to the Meltwater platform."""
+    return urlparse(url).netloc in MELTWATER_DOMAINS
+
+
+def _apply_cookie_string_to_session(session: requests.Session, cookies_str: str) -> None:
+    """Parse a browser-copied cookie string and add each cookie to a requests Session."""
+    for chunk in cookies_str.split(";"):
+        chunk = chunk.strip()
+        if "=" in chunk:
+            name, value = chunk.split("=", 1)
+            session.cookies.set(name.strip(), value.strip(), domain=".meltwater.com")
+
+
+def fetch_meltwater_with_cookies(url: str, cookies_str: str) -> str | None:
+    """Fetch a Meltwater URL using a browser-copied session cookie string."""
+    try:
+        session = requests.Session()
+        _apply_cookie_string_to_session(session, cookies_str)
+        resp = session.get(url, headers=make_headers(url), timeout=FETCH_TIMEOUT, allow_redirects=True)
+        if resp.status_code == 200:
+            text = extract_article_text(resp.text)
+            # Detect if we still landed on the login/paywall page
+            if any(phrase in text.lower() for phrase in ("sign in to meltwater", "log in to meltwater", "mention not found")):
+                logger.warning("Meltwater cookie auth appears expired for %s", url)
+                return None
+            return text
+        logger.warning("Meltwater cookie fetch returned HTTP %s for %s", resp.status_code, url)
+        return None
+    except Exception as exc:
+        logger.warning("Meltwater cookie fetch failed for %s: %s", url, exc)
+        return None
+
+
+def fetch_meltwater_login_and_get_cookies(email: str, password: str) -> dict | None:
+    """
+    Use Playwright to log in to Meltwater once and return a dict of cookies
+    that can be reused for subsequent requests in this session.
+    Returns None if login failed.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        cookies_dict: dict | None = None
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                locale="en-US",
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+
+            # Navigate to the login page
+            page.goto(MELTWATER_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            # Fill email — try common selectors
+            for selector in ['input[type="email"]', 'input[name="email"]', 'input[id*="email"]']:
+                try:
+                    page.fill(selector, email, timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+            # Some flows show password on next screen after pressing Enter/Next
+            try:
+                page.get_by_role("button", name=re.compile(r"next|continue", re.IGNORECASE)).first.click(timeout=3000)
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            # Fill password
+            for selector in ['input[type="password"]', 'input[name="password"]', 'input[id*="password"]']:
+                try:
+                    page.fill(selector, password, timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+            # Submit
+            try:
+                page.get_by_role("button", name=re.compile(r"sign in|log in|login|submit", re.IGNORECASE)).first.click(timeout=3000)
+            except Exception:
+                page.keyboard.press("Enter")
+
+            # Wait for post-login navigation
+            page.wait_for_timeout(6000)
+
+            # Check if we're past the login screen
+            current_url = page.url
+            if "login" in current_url.lower() or "signin" in current_url.lower():
+                logger.warning("Meltwater login may have failed — still on login page: %s", current_url)
+                browser.close()
+                return None
+
+            # Harvest all cookies
+            raw_cookies = context.cookies()
+            cookies_dict = {c["name"]: c["value"] for c in raw_cookies}
+            browser.close()
+
+        return cookies_dict if cookies_dict else None
+    except Exception as exc:
+        logger.warning("Meltwater Playwright login failed: %s", exc)
+        return None
+
+
+def fetch_meltwater_with_playwright_cookies(url: str, cookies_dict: dict) -> str | None:
+    """
+    Fetch a Meltwater URL using a pre-authenticated cookie dict (from a previous login).
+    Uses a new Playwright context seeded with those cookies so JS-rendered content works.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                locale="en-US",
+                viewport={"width": 1280, "height": 800},
+            )
+            # Seed cookies
+            mw_cookies = [
+                {"name": k, "value": v, "domain": ".meltwater.com", "path": "/"}
+                for k, v in cookies_dict.items()
+            ]
+            context.add_cookies(mw_cookies)
+
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+            html = page.content()
+            browser.close()
+            if not html:
+                return None
+            text = extract_article_text(html)
+            # Detect paywall / login redirect
+            if any(phrase in text.lower() for phrase in ("sign in to meltwater", "log in to meltwater")):
+                logger.warning("Meltwater session expired mid-batch for %s", url)
+                return None
+            return text
+    except Exception as exc:
+        logger.warning("Meltwater cookie-seeded Playwright fetch failed for %s: %s", url, exc)
+        return None
+
+
+def fetch_and_extract(
+    url: str,
+    hit_sentence: str = "",
+    mw_cookies_str: str = "",
+    mw_playwright_cookies: dict | None = None,
+) -> str:
     if not url.startswith("http://") and not url.startswith("https://"):
         return "ERROR: Not a web URL (internal document ID)"
 
-    article_text = fetch_via_curl_cffi(url)
+    article_text: str | None = None
+
+    # ── Meltwater-specific authenticated fetch ────────────────────────────────
+    if is_meltwater_url(url):
+        if mw_playwright_cookies:
+            article_text = fetch_meltwater_with_playwright_cookies(url, mw_playwright_cookies)
+        elif mw_cookies_str.strip():
+            article_text = fetch_meltwater_with_cookies(url, mw_cookies_str)
+        if article_text is None:
+            if not mw_cookies_str.strip() and not mw_playwright_cookies:
+                return (
+                    "ERROR: Meltwater URL requires authentication — "
+                    "add credentials in the Meltwater Auth section above"
+                )
+            return "ERROR: Meltwater auth failed or session expired — check credentials"
+
+    # ── Standard fetch pipeline ───────────────────────────────────────────────
+    if article_text is None:
+        article_text = fetch_via_curl_cffi(url)
     if not article_text:
         article_text = fetch_via_playwright(url)
     if not article_text:
@@ -435,6 +610,50 @@ with col4:
     translate = st.checkbox("Translate to English", value=False,
                              help="Uses AWS Bedrock (Claude) to translate non-English mentions")
 
+# ── Meltwater Authentication ───────────────────────────────────────────────────
+with st.expander("🔐 Meltwater Authentication", expanded=False):
+    st.markdown(
+        "<small style='color:#666;font-family:DM Mono,monospace'>"
+        "Broadcast transcript URLs on Meltwater (transition.meltwater.com) require login. "
+        "Choose how to authenticate below.</small>",
+        unsafe_allow_html=True,
+    )
+    mw_auth_method = st.radio(
+        "Authentication method",
+        ["None", "Email & Password (Playwright)", "Paste Session Cookie"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    mw_email, mw_password, mw_cookie_str = "", "", ""
+
+    if mw_auth_method == "Email & Password (Playwright)":
+        st.markdown(
+            "<small style='color:#888;font-family:DM Mono,monospace'>"
+            "Playwright will log in once and reuse the session for all Meltwater URLs in this run. "
+            "Credentials are never stored.</small>",
+            unsafe_allow_html=True,
+        )
+        mw_col1, mw_col2 = st.columns(2)
+        with mw_col1:
+            mw_email = st.text_input("Meltwater Email", key="mw_email")
+        with mw_col2:
+            mw_password = st.text_input("Meltwater Password", type="password", key="mw_password")
+
+    elif mw_auth_method == "Paste Session Cookie":
+        st.markdown(
+            "<small style='color:#888;font-family:DM Mono,monospace'>"
+            "Open a Meltwater page while logged in → DevTools → Application → Cookies → "
+            "copy the full cookie string and paste it here.</small>",
+            unsafe_allow_html=True,
+        )
+        mw_cookie_str = st.text_area(
+            "Cookie string (name=value; name2=value2; …)",
+            height=80,
+            key="mw_cookie_str",
+            placeholder="__cf_bm=abc123; mw_session=xyz789; …",
+        )
+
 st.markdown("<hr>", unsafe_allow_html=True)
 run_button = st.button("Extract Mentions")
 
@@ -483,6 +702,21 @@ if run_button:
     ok_count = 0
     error_count = 0
 
+    # ── Meltwater pre-login (once per run) ───────────────────────────────────
+    mw_playwright_cookies: dict | None = None
+    has_mw_urls = any(is_meltwater_url(r.get(url_col, "").strip()) for r in interleaved)
+
+    if has_mw_urls and mw_auth_method == "Email & Password (Playwright)":
+        if mw_email and mw_password:
+            with st.spinner("🔐 Logging in to Meltwater…"):
+                mw_playwright_cookies = fetch_meltwater_login_and_get_cookies(mw_email, mw_password)
+            if mw_playwright_cookies:
+                st.success(f"✓ Meltwater login succeeded ({len(mw_playwright_cookies)} cookies captured)")
+            else:
+                st.error("⚠ Meltwater login failed — Playwright could not authenticate. Check credentials.")
+        else:
+            st.warning("⚠ Meltwater URLs detected but no email/password provided — those rows will be skipped.")
+
     # Progress UI
     status_text = st.empty()
     progress_bar = st.progress(0)
@@ -512,7 +746,12 @@ if run_button:
                 f"<small style='font-family:DM Mono,monospace;color:#555'>🔍 {url[:80]}{'…' if len(url)>80 else ''}</small>",
                 unsafe_allow_html=True,
             )
-            result = fetch_and_extract(url, hit_sentence)
+            result = fetch_and_extract(
+                url,
+                hit_sentence,
+                mw_cookies_str=mw_cookie_str,
+                mw_playwright_cookies=mw_playwright_cookies,
+            )
             domain_last_hit[domain] = time.time()
 
             if translate and result and not result.startswith("ERROR"):
