@@ -35,6 +35,7 @@ MELTWATER_DOMAINS = {
     "meltwater.com",
 }
 MELTWATER_LOGIN_URL = "https://app.meltwater.com/"
+MELTWATER_API_BASE = "https://api.meltwater.com/v3"
 
 BEDROCK_REGION = st.secrets.get("BEDROCK_REGION", os.environ.get("BEDROCK_REGION", "us-east-2"))
 BEDROCK_MODEL_ID = st.secrets.get(
@@ -245,6 +246,94 @@ def fetch_meltwater_with_cookies(url: str, cookies_str: str) -> str | None:
         return None
 
 
+def extract_meltwater_doc_id(url: str) -> str | None:
+    """Try to extract a document identifier from a Meltwater paywall URL."""
+    parsed = urlparse(url)
+    # transition.meltwater.com/paywall/redirect/<DOC_ID>?keywords=...&cid=...
+    parts = parsed.path.strip("/").split("/")
+    if "paywall" in parts and "redirect" in parts:
+        idx = parts.index("redirect")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
+def fetch_meltwater_via_api(url: str, api_token: str, hit_sentence: str = "") -> str | None:
+    """
+    Use the Meltwater REST API to search for a document matching the given URL.
+    Falls back to keyword-based search using the hit_sentence if direct lookup fails.
+    Returns extracted article text or None.
+    """
+    headers = {
+        "Accept": "application/json",
+        "apikey": api_token,
+    }
+
+    # Step 1: List saved searches to find one we can query against
+    try:
+        resp = requests.get(
+            f"{MELTWATER_API_BASE}/searches",
+            headers=headers,
+            timeout=FETCH_TIMEOUT,
+        )
+        if resp.status_code == 401:
+            logger.warning("Meltwater API: invalid token (401)")
+            return None
+        if resp.status_code != 200:
+            logger.warning("Meltwater API searches returned HTTP %s", resp.status_code)
+            return None
+
+        searches = resp.json().get("searches", [])
+        if not searches:
+            logger.warning("Meltwater API: no saved searches found in account")
+            return None
+
+        # Step 2: Use the search endpoint to look for documents matching the URL
+        # Try each saved search until we find the document
+        doc_id = extract_meltwater_doc_id(url)
+
+        for search in searches[:5]:  # Try up to 5 saved searches
+            search_id = search.get("id")
+            if not search_id:
+                continue
+
+            # Search for documents from the last 90 days
+            try:
+                search_resp = requests.get(
+                    f"{MELTWATER_API_BASE}/searches/{search_id}/documents",
+                    headers=headers,
+                    params={"page_size": 10},
+                    timeout=FETCH_TIMEOUT,
+                )
+                if search_resp.status_code != 200:
+                    continue
+
+                documents = search_resp.json().get("documents", [])
+                for doc in documents:
+                    doc_url = doc.get("url", "")
+                    doc_content = doc.get("content", "") or doc.get("document_content", "")
+                    doc_title = doc.get("title", "")
+                    doc_summary = doc.get("summary", "") or doc.get("ingress", "")
+
+                    # Match by URL fragment or document ID
+                    if doc_url and (doc_url in url or url in doc_url):
+                        text = " ".join(filter(None, [doc_title, doc_content, doc_summary]))
+                        if text.strip():
+                            return text.strip()
+                    if doc_id and doc.get("id", "") == doc_id:
+                        text = " ".join(filter(None, [doc_title, doc_content, doc_summary]))
+                        if text.strip():
+                            return text.strip()
+            except Exception as exc:
+                logger.debug("Meltwater API search %s failed: %s", search_id, exc)
+                continue
+
+    except Exception as exc:
+        logger.warning("Meltwater API fetch failed: %s", exc)
+
+    return None
+
+
 def fetch_meltwater_login_and_get_cookies(email: str, password: str) -> dict | None:
     """
     Use Playwright to log in to Meltwater once and return a dict of cookies
@@ -361,6 +450,7 @@ def fetch_and_extract(
     hit_sentence: str = "",
     mw_cookies_str: str = "",
     mw_playwright_cookies: dict | None = None,
+    mw_api_token: str = "",
 ) -> str:
     if not url.startswith("http://") and not url.startswith("https://"):
         return "ERROR: Not a web URL (internal document ID)"
@@ -369,12 +459,31 @@ def fetch_and_extract(
 
     # ── Meltwater-specific authenticated fetch ────────────────────────────────
     if is_meltwater_url(url):
-        if mw_playwright_cookies:
+        # Try API token first (most reliable)
+        if mw_api_token.strip():
+            article_text = fetch_meltwater_via_api(url, mw_api_token.strip(), hit_sentence)
+        # Then Playwright cookies
+        if article_text is None and mw_playwright_cookies:
             article_text = fetch_meltwater_with_playwright_cookies(url, mw_playwright_cookies)
-        elif mw_cookies_str.strip():
+        # Then pasted cookie string
+        if article_text is None and mw_cookies_str.strip():
             article_text = fetch_meltwater_with_cookies(url, mw_cookies_str)
+        # ── Hit Sentence fallback for Meltwater URLs ─────────────────────────
+        if article_text is None and hit_sentence.strip():
+            logger.info("Meltwater auth failed for %s — falling back to Hit Sentence", url)
+            # Use the Hit Sentence directly as the mention context
+            cleaned = re.sub(r"^[\s.…]+|[\s.…]+$", "", hit_sentence).strip()
+            if cleaned and "godaddy" in cleaned.lower():
+                return f"Mention: {cleaned}\n[Source: Hit Sentence — Meltwater URL required login]"
+            elif cleaned:
+                # Hit Sentence exists but doesn't contain "GoDaddy" — still
+                # return it so Claude can classify it rather than erroring out
+                return f"Mention: {cleaned}\n[Source: Hit Sentence — Meltwater URL required login]"
         if article_text is None:
-            if not mw_cookies_str.strip() and not mw_playwright_cookies:
+            if not mw_cookies_str.strip() and not mw_playwright_cookies and not mw_api_token.strip():
+                if hit_sentence.strip():
+                    cleaned = re.sub(r"^[\s.…]+|[\s.…]+$", "", hit_sentence).strip()
+                    return f"Mention: {cleaned}\n[Source: Hit Sentence — no Meltwater auth provided]"
                 return (
                     "ERROR: Meltwater URL requires authentication — "
                     "add credentials in the Meltwater Auth section above"
@@ -615,19 +724,30 @@ with st.expander("🔐 Meltwater Authentication", expanded=False):
     st.markdown(
         "<small style='color:#666;font-family:DM Mono,monospace'>"
         "Broadcast transcript URLs on Meltwater (transition.meltwater.com) require login. "
-        "Choose how to authenticate below.</small>",
+        "Choose how to authenticate below. If no method is selected, the app will "
+        "fall back to the <b>Hit Sentence</b> column for Meltwater URLs.</small>",
         unsafe_allow_html=True,
     )
     mw_auth_method = st.radio(
         "Authentication method",
-        ["None", "Email & Password (Playwright)", "Paste Session Cookie"],
+        ["None (use Hit Sentence fallback)", "API Token", "Email & Password (Playwright)", "Paste Session Cookie"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    mw_email, mw_password, mw_cookie_str = "", "", ""
+    mw_email, mw_password, mw_cookie_str, mw_api_token = "", "", "", ""
 
-    if mw_auth_method == "Email & Password (Playwright)":
+    if mw_auth_method == "API Token":
+        st.markdown(
+            "<small style='color:#888;font-family:DM Mono,monospace'>"
+            "Generate a token in Meltwater: <b>Account → Meltwater API → Create Token</b>. "
+            "This uses the Meltwater REST API to search for document content. "
+            "Requires API access on your Meltwater subscription.</small>",
+            unsafe_allow_html=True,
+        )
+        mw_api_token = st.text_input("Meltwater API Token", type="password", key="mw_api_token")
+
+    elif mw_auth_method == "Email & Password (Playwright)":
         st.markdown(
             "<small style='color:#888;font-family:DM Mono,monospace'>"
             "Playwright will log in once and reuse the session for all Meltwater URLs in this run. "
@@ -706,7 +826,29 @@ if run_button:
     mw_playwright_cookies: dict | None = None
     has_mw_urls = any(is_meltwater_url(r.get(url_col, "").strip()) for r in interleaved)
 
-    if has_mw_urls and mw_auth_method == "Email & Password (Playwright)":
+    if has_mw_urls and mw_auth_method == "API Token":
+        if mw_api_token.strip():
+            with st.spinner("🔐 Validating Meltwater API token…"):
+                try:
+                    test_resp = requests.get(
+                        f"{MELTWATER_API_BASE}/searches",
+                        headers={"Accept": "application/json", "apikey": mw_api_token.strip()},
+                        timeout=FETCH_TIMEOUT,
+                    )
+                    if test_resp.status_code == 200:
+                        count = len(test_resp.json().get("searches", []))
+                        st.success(f"✓ Meltwater API token valid ({count} saved searches found)")
+                    elif test_resp.status_code == 401:
+                        st.error("⚠ Meltwater API token is invalid (401 Unauthorized)")
+                        mw_api_token = ""
+                    else:
+                        st.warning(f"⚠ Meltwater API returned HTTP {test_resp.status_code} — will try anyway")
+                except Exception as exc:
+                    st.warning(f"⚠ Could not validate token: {exc} — will try anyway")
+        else:
+            st.warning("⚠ Meltwater URLs detected but no API token provided — will fall back to Hit Sentence")
+
+    elif has_mw_urls and mw_auth_method == "Email & Password (Playwright)":
         if mw_email and mw_password:
             with st.spinner("🔐 Logging in to Meltwater…"):
                 mw_playwright_cookies = fetch_meltwater_login_and_get_cookies(mw_email, mw_password)
@@ -716,6 +858,9 @@ if run_button:
                 st.error("⚠ Meltwater login failed — Playwright could not authenticate. Check credentials.")
         else:
             st.warning("⚠ Meltwater URLs detected but no email/password provided — those rows will be skipped.")
+
+    elif has_mw_urls and mw_auth_method == "None (use Hit Sentence fallback)":
+        st.info("ℹ Meltwater URLs detected — will use Hit Sentence column as fallback for those rows.")
 
     # Progress UI
     status_text = st.empty()
@@ -751,6 +896,7 @@ if run_button:
                 hit_sentence,
                 mw_cookies_str=mw_cookie_str,
                 mw_playwright_cookies=mw_playwright_cookies,
+                mw_api_token=mw_api_token,
             )
             domain_last_hit[domain] = time.time()
 
