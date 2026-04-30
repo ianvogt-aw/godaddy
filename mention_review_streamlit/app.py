@@ -5,6 +5,8 @@ import logging
 import os
 import random
 import re
+import subprocess
+import sys
 import time
 from urllib.parse import urlparse
 
@@ -16,6 +18,35 @@ from bs4 import BeautifulSoup
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ── Playwright browser auto-install ──────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _ensure_playwright_browsers() -> bool:
+    """
+    Install Playwright's Chromium browser if it isn't already present.
+    Runs once per process lifetime (cached). Returns True on success.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            logger.info("Playwright Chromium ready")
+            return True
+        logger.warning("playwright install chromium exited %s: %s", result.returncode, result.stderr[:400])
+        # Also try installing system deps (needed on some Linux hosts)
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return False
+    except Exception as exc:
+        logger.warning("Could not auto-install Playwright browsers: %s", exc)
+        return False
+
+_playwright_ready = _ensure_playwright_browsers()
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -35,7 +66,6 @@ MELTWATER_DOMAINS = {
     "meltwater.com",
 }
 MELTWATER_LOGIN_URL = "https://app.meltwater.com/"
-MELTWATER_API_BASE = "https://api.meltwater.com/v3"
 
 BEDROCK_REGION = st.secrets.get("BEDROCK_REGION", os.environ.get("BEDROCK_REGION", "us-east-2"))
 BEDROCK_MODEL_ID = st.secrets.get(
@@ -246,105 +276,25 @@ def fetch_meltwater_with_cookies(url: str, cookies_str: str) -> str | None:
         return None
 
 
-def extract_meltwater_doc_id(url: str) -> str | None:
-    """Try to extract a document identifier from a Meltwater paywall URL."""
-    parsed = urlparse(url)
-    # transition.meltwater.com/paywall/redirect/<DOC_ID>?keywords=...&cid=...
-    parts = parsed.path.strip("/").split("/")
-    if "paywall" in parts and "redirect" in parts:
-        idx = parts.index("redirect")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    return None
-
-
-def fetch_meltwater_via_api(url: str, api_token: str, hit_sentence: str = "") -> str | None:
+def fetch_meltwater_login_and_get_cookies(
+    email: str, password: str, debug_screenshot: bool = False
+) -> tuple[dict | None, str]:
     """
-    Use the Meltwater REST API to search for a document matching the given URL.
-    Falls back to keyword-based search using the hit_sentence if direct lookup fails.
-    Returns extracted article text or None.
-    """
-    headers = {
-        "Accept": "application/json",
-        "apikey": api_token,
-    }
-
-    # Step 1: List saved searches to find one we can query against
-    try:
-        resp = requests.get(
-            f"{MELTWATER_API_BASE}/searches",
-            headers=headers,
-            timeout=FETCH_TIMEOUT,
-        )
-        if resp.status_code == 401:
-            logger.warning("Meltwater API: invalid token (401)")
-            return None
-        if resp.status_code != 200:
-            logger.warning("Meltwater API searches returned HTTP %s", resp.status_code)
-            return None
-
-        searches = resp.json().get("searches", [])
-        if not searches:
-            logger.warning("Meltwater API: no saved searches found in account")
-            return None
-
-        # Step 2: Use the search endpoint to look for documents matching the URL
-        # Try each saved search until we find the document
-        doc_id = extract_meltwater_doc_id(url)
-
-        for search in searches[:5]:  # Try up to 5 saved searches
-            search_id = search.get("id")
-            if not search_id:
-                continue
-
-            # Search for documents from the last 90 days
-            try:
-                search_resp = requests.get(
-                    f"{MELTWATER_API_BASE}/searches/{search_id}/documents",
-                    headers=headers,
-                    params={"page_size": 10},
-                    timeout=FETCH_TIMEOUT,
-                )
-                if search_resp.status_code != 200:
-                    continue
-
-                documents = search_resp.json().get("documents", [])
-                for doc in documents:
-                    doc_url = doc.get("url", "")
-                    doc_content = doc.get("content", "") or doc.get("document_content", "")
-                    doc_title = doc.get("title", "")
-                    doc_summary = doc.get("summary", "") or doc.get("ingress", "")
-
-                    # Match by URL fragment or document ID
-                    if doc_url and (doc_url in url or url in doc_url):
-                        text = " ".join(filter(None, [doc_title, doc_content, doc_summary]))
-                        if text.strip():
-                            return text.strip()
-                    if doc_id and doc.get("id", "") == doc_id:
-                        text = " ".join(filter(None, [doc_title, doc_content, doc_summary]))
-                        if text.strip():
-                            return text.strip()
-            except Exception as exc:
-                logger.debug("Meltwater API search %s failed: %s", search_id, exc)
-                continue
-
-    except Exception as exc:
-        logger.warning("Meltwater API fetch failed: %s", exc)
-
-    return None
-
-
-def fetch_meltwater_login_and_get_cookies(email: str, password: str) -> dict | None:
-    """
-    Use Playwright to log in to Meltwater once and return a dict of cookies
-    that can be reused for subsequent requests in this session.
-    Returns None if login failed.
+    Use Playwright to log in to Meltwater once and return (cookies_dict, status_message).
+    cookies_dict is None on failure.  status_message describes what happened.
     """
     try:
-        from playwright.sync_api import sync_playwright
-        cookies_dict: dict | None = None
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return None, "Playwright is not installed"
+
+    cookies_dict: dict | None = None
+    status_msg = "Unknown error"
+    screenshot_b64: str | None = None
+
+    try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(
                 user_agent=random.choice(USER_AGENTS),
                 locale="en-US",
@@ -352,58 +302,143 @@ def fetch_meltwater_login_and_get_cookies(email: str, password: str) -> dict | N
             )
             page = context.new_page()
 
-            # Navigate to the login page
-            page.goto(MELTWATER_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
-
-            # Fill email — try common selectors
-            for selector in ['input[type="email"]', 'input[name="email"]', 'input[id*="email"]']:
+            # ── Navigate to login ────────────────────────────────────────────
+            # Try the direct login path first; fall back to root which should redirect
+            for login_url in [
+                "https://app.meltwater.com/login",
+                "https://app.meltwater.com/",
+            ]:
                 try:
-                    page.fill(selector, email, timeout=3000)
+                    page.goto(login_url, wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(2000)
+                    # Stop if we can see an email input
+                    for sel in ['input[type="email"]', 'input[name="email"]',
+                                'input[name="username"]', 'input[autocomplete="email"]']:
+                        if page.is_visible(sel, timeout=1000):
+                            break
+                    else:
+                        continue  # try next URL
                     break
                 except Exception:
                     continue
 
-            # Some flows show password on next screen after pressing Enter/Next
-            try:
-                page.get_by_role("button", name=re.compile(r"next|continue", re.IGNORECASE)).first.click(timeout=3000)
-                page.wait_for_timeout(1500)
-            except Exception:
-                pass
+            logger.info("Meltwater login: landed on %s", page.url)
 
-            # Fill password
-            for selector in ['input[type="password"]', 'input[name="password"]', 'input[id*="password"]']:
+            # ── Step 1: fill email ───────────────────────────────────────────
+            email_selectors = [
+                'input[type="email"]', 'input[name="email"]',
+                'input[name="username"]', 'input[autocomplete="email"]',
+                'input[placeholder*="email" i]', 'input[id*="email" i]',
+            ]
+            filled_email = False
+            for sel in email_selectors:
                 try:
-                    page.fill(selector, password, timeout=3000)
-                    break
+                    if page.is_visible(sel, timeout=2000):
+                        page.fill(sel, email)
+                        filled_email = True
+                        logger.info("Filled email with selector: %s", sel)
+                        break
                 except Exception:
                     continue
 
-            # Submit
+            if not filled_email:
+                if debug_screenshot:
+                    screenshot_b64 = page.screenshot(type="png").hex()
+                browser.close()
+                return None, "Could not find the email input field — Meltwater's login page may have changed"
+
+            # ── Step 2: advance to password (some flows hide it behind Next) ─
             try:
-                page.get_by_role("button", name=re.compile(r"sign in|log in|login|submit", re.IGNORECASE)).first.click(timeout=3000)
+                next_btn = page.get_by_role(
+                    "button", name=re.compile(r"next|continue|proceed", re.IGNORECASE)
+                ).first
+                if next_btn.is_visible(timeout=2000):
+                    next_btn.click()
+                    page.wait_for_timeout(2000)
             except Exception:
+                pass  # single-page form — password already visible
+
+            # ── Step 3: fill password ────────────────────────────────────────
+            password_selectors = [
+                'input[type="password"]', 'input[name="password"]',
+                'input[autocomplete="current-password"]', 'input[id*="password" i]',
+            ]
+            filled_pw = False
+            for sel in password_selectors:
+                try:
+                    if page.is_visible(sel, timeout=3000):
+                        page.fill(sel, password)
+                        filled_pw = True
+                        logger.info("Filled password with selector: %s", sel)
+                        break
+                except Exception:
+                    continue
+
+            if not filled_pw:
+                if debug_screenshot:
+                    screenshot_b64 = page.screenshot(type="png").hex()
+                browser.close()
+                return None, "Could not find the password input field — login flow may require SSO/MFA"
+
+            # ── Step 4: submit ───────────────────────────────────────────────
+            submitted = False
+            for btn_name in [r"sign in|log in|login|submit|continue", r".*"]:
+                try:
+                    btn = page.get_by_role(
+                        "button", name=re.compile(btn_name, re.IGNORECASE)
+                    ).first
+                    if btn.is_visible(timeout=1500):
+                        btn.click()
+                        submitted = True
+                        break
+                except Exception:
+                    continue
+            if not submitted:
                 page.keyboard.press("Enter")
 
-            # Wait for post-login navigation
-            page.wait_for_timeout(6000)
+            # ── Step 5: wait for post-login navigation ───────────────────────
+            try:
+                page.wait_for_url(
+                    re.compile(r"app\.meltwater\.com/(?!login|signin)"),
+                    timeout=12000,
+                )
+            except PWTimeout:
+                pass  # URL check may fail for some SSO flows; check below
+            page.wait_for_timeout(2000)
 
-            # Check if we're past the login screen
-            current_url = page.url
-            if "login" in current_url.lower() or "signin" in current_url.lower():
-                logger.warning("Meltwater login may have failed — still on login page: %s", current_url)
+            final_url = page.url
+            logger.info("Meltwater post-login URL: %s", final_url)
+
+            # Capture debug screenshot before closing
+            if debug_screenshot:
+                screenshot_b64 = page.screenshot(type="png").hex()
+
+            still_on_login = any(k in final_url.lower() for k in ("login", "signin", "sign-in", "auth"))
+            if still_on_login:
                 browser.close()
-                return None
+                return None, (
+                    f"Still on login page after submit ({final_url}). "
+                    "Possible causes: wrong password, SSO/MFA required, or CAPTCHA."
+                )
 
-            # Harvest all cookies
             raw_cookies = context.cookies()
+            if not raw_cookies:
+                browser.close()
+                return None, "Login page redirected but no cookies were set — session may not have established"
+
             cookies_dict = {c["name"]: c["value"] for c in raw_cookies}
             browser.close()
+            status_msg = f"OK — {len(cookies_dict)} cookies captured, final URL: {final_url}"
 
-        return cookies_dict if cookies_dict else None
     except Exception as exc:
-        logger.warning("Meltwater Playwright login failed: %s", exc)
-        return None
+        status_msg = f"Playwright exception: {exc}"
+        logger.warning("Meltwater Playwright login error: %s", exc)
+
+    # Store debug screenshot in session state so the UI can display it
+    if debug_screenshot and screenshot_b64:
+        st.session_state["_mw_debug_screenshot"] = screenshot_b64
+
+    return cookies_dict, status_msg
 
 
 def fetch_meltwater_with_playwright_cookies(url: str, cookies_dict: dict) -> str | None:
@@ -450,7 +485,6 @@ def fetch_and_extract(
     hit_sentence: str = "",
     mw_cookies_str: str = "",
     mw_playwright_cookies: dict | None = None,
-    mw_api_token: str = "",
 ) -> str:
     if not url.startswith("http://") and not url.startswith("https://"):
         return "ERROR: Not a web URL (internal document ID)"
@@ -459,31 +493,12 @@ def fetch_and_extract(
 
     # ── Meltwater-specific authenticated fetch ────────────────────────────────
     if is_meltwater_url(url):
-        # Try API token first (most reliable)
-        if mw_api_token.strip():
-            article_text = fetch_meltwater_via_api(url, mw_api_token.strip(), hit_sentence)
-        # Then Playwright cookies
-        if article_text is None and mw_playwright_cookies:
+        if mw_playwright_cookies:
             article_text = fetch_meltwater_with_playwright_cookies(url, mw_playwright_cookies)
-        # Then pasted cookie string
-        if article_text is None and mw_cookies_str.strip():
+        elif mw_cookies_str.strip():
             article_text = fetch_meltwater_with_cookies(url, mw_cookies_str)
-        # ── Hit Sentence fallback for Meltwater URLs ─────────────────────────
-        if article_text is None and hit_sentence.strip():
-            logger.info("Meltwater auth failed for %s — falling back to Hit Sentence", url)
-            # Use the Hit Sentence directly as the mention context
-            cleaned = re.sub(r"^[\s.…]+|[\s.…]+$", "", hit_sentence).strip()
-            if cleaned and "godaddy" in cleaned.lower():
-                return f"Mention: {cleaned}\n[Source: Hit Sentence — Meltwater URL required login]"
-            elif cleaned:
-                # Hit Sentence exists but doesn't contain "GoDaddy" — still
-                # return it so Claude can classify it rather than erroring out
-                return f"Mention: {cleaned}\n[Source: Hit Sentence — Meltwater URL required login]"
         if article_text is None:
-            if not mw_cookies_str.strip() and not mw_playwright_cookies and not mw_api_token.strip():
-                if hit_sentence.strip():
-                    cleaned = re.sub(r"^[\s.…]+|[\s.…]+$", "", hit_sentence).strip()
-                    return f"Mention: {cleaned}\n[Source: Hit Sentence — no Meltwater auth provided]"
+            if not mw_cookies_str.strip() and not mw_playwright_cookies:
                 return (
                     "ERROR: Meltwater URL requires authentication — "
                     "add credentials in the Meltwater Auth section above"
@@ -662,6 +677,7 @@ st.markdown("""
         margin-top: 0.3rem;
     }
     .stat-num.errors { color: #c0392b; }
+    .stat-num.fallback { color: #d68910; }
     .stDownloadButton > button {
         background: #fff;
         color: #1a1a1a;
@@ -724,30 +740,19 @@ with st.expander("🔐 Meltwater Authentication", expanded=False):
     st.markdown(
         "<small style='color:#666;font-family:DM Mono,monospace'>"
         "Broadcast transcript URLs on Meltwater (transition.meltwater.com) require login. "
-        "Choose how to authenticate below. If no method is selected, the app will "
-        "fall back to the <b>Hit Sentence</b> column for Meltwater URLs.</small>",
+        "Choose how to authenticate below.</small>",
         unsafe_allow_html=True,
     )
     mw_auth_method = st.radio(
         "Authentication method",
-        ["None (use Hit Sentence fallback)", "API Token", "Email & Password (Playwright)", "Paste Session Cookie"],
+        ["None", "Email & Password (Playwright)", "Paste Session Cookie"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    mw_email, mw_password, mw_cookie_str, mw_api_token = "", "", "", ""
+    mw_email, mw_password, mw_cookie_str = "", "", ""
 
-    if mw_auth_method == "API Token":
-        st.markdown(
-            "<small style='color:#888;font-family:DM Mono,monospace'>"
-            "Generate a token in Meltwater: <b>Account → Meltwater API → Create Token</b>. "
-            "This uses the Meltwater REST API to search for document content. "
-            "Requires API access on your Meltwater subscription.</small>",
-            unsafe_allow_html=True,
-        )
-        mw_api_token = st.text_input("Meltwater API Token", type="password", key="mw_api_token")
-
-    elif mw_auth_method == "Email & Password (Playwright)":
+    if mw_auth_method == "Email & Password (Playwright)":
         st.markdown(
             "<small style='color:#888;font-family:DM Mono,monospace'>"
             "Playwright will log in once and reuse the session for all Meltwater URLs in this run. "
@@ -821,34 +826,13 @@ if run_button:
     total = len(interleaved)
     ok_count = 0
     error_count = 0
+    fallback_count = 0
 
     # ── Meltwater pre-login (once per run) ───────────────────────────────────
     mw_playwright_cookies: dict | None = None
     has_mw_urls = any(is_meltwater_url(r.get(url_col, "").strip()) for r in interleaved)
 
-    if has_mw_urls and mw_auth_method == "API Token":
-        if mw_api_token.strip():
-            with st.spinner("🔐 Validating Meltwater API token…"):
-                try:
-                    test_resp = requests.get(
-                        f"{MELTWATER_API_BASE}/searches",
-                        headers={"Accept": "application/json", "apikey": mw_api_token.strip()},
-                        timeout=FETCH_TIMEOUT,
-                    )
-                    if test_resp.status_code == 200:
-                        count = len(test_resp.json().get("searches", []))
-                        st.success(f"✓ Meltwater API token valid ({count} saved searches found)")
-                    elif test_resp.status_code == 401:
-                        st.error("⚠ Meltwater API token is invalid (401 Unauthorized)")
-                        mw_api_token = ""
-                    else:
-                        st.warning(f"⚠ Meltwater API returned HTTP {test_resp.status_code} — will try anyway")
-                except Exception as exc:
-                    st.warning(f"⚠ Could not validate token: {exc} — will try anyway")
-        else:
-            st.warning("⚠ Meltwater URLs detected but no API token provided — will fall back to Hit Sentence")
-
-    elif has_mw_urls and mw_auth_method == "Email & Password (Playwright)":
+    if has_mw_urls and mw_auth_method == "Email & Password (Playwright)":
         if mw_email and mw_password:
             with st.spinner("🔐 Logging in to Meltwater…"):
                 mw_playwright_cookies = fetch_meltwater_login_and_get_cookies(mw_email, mw_password)
@@ -858,9 +842,6 @@ if run_button:
                 st.error("⚠ Meltwater login failed — Playwright could not authenticate. Check credentials.")
         else:
             st.warning("⚠ Meltwater URLs detected but no email/password provided — those rows will be skipped.")
-
-    elif has_mw_urls and mw_auth_method == "None (use Hit Sentence fallback)":
-        st.info("ℹ Meltwater URLs detected — will use Hit Sentence column as fallback for those rows.")
 
     # Progress UI
     status_text = st.empty()
@@ -896,7 +877,6 @@ if run_button:
                 hit_sentence,
                 mw_cookies_str=mw_cookie_str,
                 mw_playwright_cookies=mw_playwright_cookies,
-                mw_api_token=mw_api_token,
             )
             domain_last_hit[domain] = time.time()
 
@@ -909,11 +889,19 @@ if run_button:
                     )
                     result = translate_to_english(result)
 
-            row[output_col_name] = result
-            if result.startswith("ERROR"):
-                error_count += 1
+            # ── Hit Sentence fallback ─────────────────────────────────────
+            if result.startswith("ERROR") and hit_sentence:
+                logger.info("URL fetch failed (%s) — falling back to Hit Sentence for %s", result, url)
+                result = f"[Hit Sentence] {hit_sentence}"
+                row[output_col_name] = result
+                fallback_count += 1
+                ok_count += 1  # counts as usable, not an error
             else:
-                ok_count += 1
+                row[output_col_name] = result
+                if result.startswith("ERROR"):
+                    error_count += 1
+                else:
+                    ok_count += 1
 
             if i < total - 1:
                 time.sleep(delay + random.uniform(0.5, 1.0))
@@ -927,6 +915,7 @@ if run_button:
             f"""<div class="stat-row">
                 <div class="stat-box"><div class="stat-num">{i+1}/{total}</div><div class="stat-label">Processed</div></div>
                 <div class="stat-box"><div class="stat-num">{ok_count}</div><div class="stat-label">Extracted</div></div>
+                <div class="stat-box"><div class="stat-num fallback">{fallback_count}</div><div class="stat-label">Hit Sentence Fallback</div></div>
                 <div class="stat-box"><div class="stat-num errors">{error_count}</div><div class="stat-label">Errors</div></div>
             </div>""",
             unsafe_allow_html=True,
