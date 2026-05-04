@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import json
+import boto3
 from datetime import datetime, date
-from anthropic import Anthropic
 
 # ──────────────────────────────────────────────────────────────
 # Page config
@@ -15,6 +15,13 @@ st.set_page_config(
 
 st.title("📊 Media Coverage Insights Generator")
 st.markdown("Upload your Excel workbook, pick a date range, and let Claude generate business-unit summaries, an executive summary, and strategic insights — all in one click.")
+
+st.info(
+    "**⚠️ Data Preparation Required:** This application assumes you are uploading the following: "
+    "a version of the GoDaddy Grid with only relevant data. This means you must save a copy of "
+    "the grid with only coverage data from the month of interest (delete scrubbed rows + old "
+    "coverage, use sorting to make this easy)."
+)
 
 # ──────────────────────────────────────────────────────────────
 # Hardcoded sheet → internal-name mapping (order matters)
@@ -126,17 +133,37 @@ def load_and_process(file_bytes, start_date, end_date):
 
 
 # ──────────────────────────────────────────────────────────────
-# LLM helpers
+# AWS Bedrock configuration
 # ──────────────────────────────────────────────────────────────
-def call_claude(client, prompt, max_tokens=400):
-    """Send a single prompt to Claude and return the text."""
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=max_tokens,
-        temperature=0.5,
-        messages=[{"role": "user", "content": prompt}],
+CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+
+# ──────────────────────────────────────────────────────────────
+# LLM helpers  (matches original notebook's Bedrock calls)
+# ──────────────────────────────────────────────────────────────
+def call_claude(bedrock_client, prompt, max_tokens=400):
+    """Invoke Claude via AWS Bedrock, matching the original notebook pattern."""
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.5,
+    })
+
+    response = bedrock_client.invoke_model(
+        modelId=CLAUDE_MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=body,
     )
-    return response.content[0].text
+
+    result = json.loads(response["body"].read())
+    return result["content"][0]["text"]
 
 
 def generate_coverage_summary(client, df, unit_name, date_range):
@@ -210,7 +237,13 @@ Generate the three insights now, formatted as bullet points."""
 # ──────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
-    api_key = st.text_input("Anthropic API Key", type="password", help="Your key stays in-memory and is never stored.")
+
+    st.subheader("AWS Credentials")
+    aws_region = st.text_input("AWS Region", value="us-east-2")
+    aws_access_key = st.text_input("AWS Access Key ID", type="password")
+    aws_secret_key = st.text_input("AWS Secret Access Key", type="password")
+    st.caption("Leave credentials blank to use your default AWS profile (~/.aws/credentials or env vars).")
+
     st.divider()
     col1, col2 = st.columns(2)
     with col1:
@@ -225,7 +258,10 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Upload your Excel workbook (.xlsx)", type=["xlsx", "xls"])
 
-if uploaded_file and api_key:
+# Determine if AWS credentials are available (explicit or default profile)
+aws_ready = bool(aws_region)
+
+if uploaded_file and aws_ready:
     datasets = load_and_process(uploaded_file.read(), start_date, end_date)
 
     # Show quick stats
@@ -237,7 +273,24 @@ if uploaded_file and api_key:
     st.divider()
 
     if st.button("🚀 Generate Insights", type="primary", use_container_width=True):
-        client = Anthropic(api_key=api_key)
+        # Build the Bedrock client, matching the original notebook
+        try:
+            if aws_access_key and aws_secret_key:
+                bedrock_runtime = boto3.client(
+                    "bedrock-runtime",
+                    region_name=aws_region,
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                )
+            else:
+                bedrock_runtime = boto3.client(
+                    "bedrock-runtime",
+                    region_name=aws_region,
+                )
+        except Exception as e:
+            st.error(f"Failed to connect to AWS Bedrock: {e}")
+            st.stop()
+
         date_range_text = f"{start_date} to {end_date}"
         summaries = {}
 
@@ -251,7 +304,7 @@ if uploaded_file and api_key:
                 text=f"Summarizing {unit_label} …",
             )
             summary = generate_coverage_summary(
-                client,
+                bedrock_runtime,
                 datasets[unit_key],
                 unit_key.replace("_", " ").title(),
                 date_range_text,
@@ -266,7 +319,7 @@ if uploaded_file and api_key:
             text="Generating executive summary …",
         )
         st.subheader("📋 Executive Summary")
-        exec_summary = generate_executive_summary(client, summaries, date_range_text)
+        exec_summary = generate_executive_summary(bedrock_runtime, summaries, date_range_text)
         st.markdown(exec_summary)
 
         # ── Overall insights ──
@@ -275,12 +328,10 @@ if uploaded_file and api_key:
             text="Generating overall insights …",
         )
         st.subheader("💡 Overall Insights")
-        insights = generate_overall_insights(client, datasets["all_coverage"], date_range_text)
+        insights = generate_overall_insights(bedrock_runtime, datasets["all_coverage"], date_range_text)
         st.markdown(insights)
 
         progress.progress(1.0, text="✅ Analysis complete!")
 
-elif uploaded_file and not api_key:
-    st.info("Enter your Anthropic API key in the sidebar to continue.")
 elif not uploaded_file:
     st.info("Upload an Excel workbook to get started.")
