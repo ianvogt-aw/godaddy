@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import json
 import boto3
-from datetime import datetime, date
 
 # ──────────────────────────────────────────────────────────────
 # Page config
@@ -14,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("📊 Media Coverage Insights Generator")
-st.markdown("Upload your Excel workbook, pick a date range, and let Claude generate business-unit summaries, an executive summary, and strategic insights — all in one click.")
+st.markdown("Upload your prepared Excel workbook and let Claude generate business-unit summaries, an executive summary, and strategic insights — all in one click.")
 
 st.info(
     "**⚠️ Data Preparation Required:** This application assumes you are uploading the following: "
@@ -60,8 +59,8 @@ BUSINESS_UNITS = [
 # Data helpers
 # ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading Excel file …")
-def load_and_process(file_bytes, start_date, end_date):
-    """Read the uploaded Excel, filter by date range, return combined datasets."""
+def load_and_process(file_bytes):
+    """Read the uploaded Excel and create combined datasets."""
     xls = pd.ExcelFile(file_bytes)
     actual_sheets = xls.sheet_names
 
@@ -80,13 +79,6 @@ def load_and_process(file_bytes, start_date, end_date):
     for name, df in dataframes.items():
         if "Date" in df.columns:
             dataframes[name]["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-
-    # Filter by date range
-    start = pd.Timestamp(start_date)
-    end = pd.Timestamp(end_date)
-    for name, df in dataframes.items():
-        if "Date" in df.columns:
-            dataframes[name] = df[(df["Date"] >= start) & (df["Date"] <= end)]
 
     # Helper to safely select columns
     def cols(df):
@@ -133,9 +125,12 @@ def load_and_process(file_bytes, start_date, end_date):
 
 
 # ──────────────────────────────────────────────────────────────
-# AWS Bedrock configuration
+# AWS Bedrock configuration  (read from .streamlit/secrets.toml)
 # ──────────────────────────────────────────────────────────────
-CLAUDE_MODEL_ID = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+AWS_REGION = st.secrets["BEDROCK_REGION"]
+AWS_ACCESS_KEY_ID = st.secrets["AWS_ACCESS_KEY_ID"]
+AWS_SECRET_ACCESS_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
+CLAUDE_MODEL_ID = st.secrets["BEDROCK_MODEL_ID"]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -166,8 +161,11 @@ def call_claude(bedrock_client, prompt, max_tokens=400):
     return result["content"][0]["text"]
 
 
-def generate_coverage_summary(client, df, unit_name, date_range):
+def generate_coverage_summary(client, df, unit_name):
     coverage_data = df[["Date", "Title", "Hit Sentence"]].to_string(index=False)
+    min_date = df["Date"].min()
+    max_date = df["Date"].max()
+    date_range = f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}" if pd.notna(min_date) else "N/A"
     prompt = f"""You are analyzing media coverage data for the {unit_name} business unit of GoDaddy.
 
 Dataset: {unit_name}
@@ -189,7 +187,7 @@ GUIDELINES:
     return call_claude(client, prompt, max_tokens=300)
 
 
-def generate_executive_summary(client, summaries, date_range):
+def generate_executive_summary(client, summaries):
     summaries_text = "\n\n".join(
         [f"{name.upper()}:\n{summary}" for name, summary in summaries.items()]
     )
@@ -210,8 +208,11 @@ Keep the summary factual and focused on what the data showed."""
     return call_claude(client, prompt, max_tokens=400)
 
 
-def generate_overall_insights(client, all_coverage_df, date_range):
+def generate_overall_insights(client, all_coverage_df):
     coverage_data = all_coverage_df[["Date", "Title", "Hit Sentence"]].to_string(index=False)
+    min_date = all_coverage_df["Date"].min()
+    max_date = all_coverage_df["Date"].max()
+    date_range = f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}" if pd.notna(min_date) else "N/A"
     prompt = f"""You are analyzing ALL media coverage data for GoDaddy for the period {date_range}.
 
 Total articles: {len(all_coverage_df)}
@@ -233,24 +234,10 @@ Generate the three insights now, formatted as bullet points."""
 
 
 # ──────────────────────────────────────────────────────────────
-# Sidebar — configuration
+# Sidebar — reference info only
 # ──────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuration")
-
-    st.subheader("AWS Credentials")
-    aws_region = st.text_input("AWS Region", value="us-east-2")
-    aws_access_key = st.text_input("AWS Access Key ID", type="password")
-    aws_secret_key = st.text_input("AWS Secret Access Key", type="password")
-    st.caption("Leave credentials blank to use your default AWS profile (~/.aws/credentials or env vars).")
-
-    st.divider()
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start date", value=date(2026, 3, 1))
-    with col2:
-        end_date = st.date_input("End date", value=date(2026, 3, 31))
-    st.divider()
+    st.header("ℹ️ Reference")
     st.caption("**Expected sheets (first 15, in order):** " + ", ".join(SHEET_NAMES))
 
 # ──────────────────────────────────────────────────────────────
@@ -258,11 +245,8 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("Upload your Excel workbook (.xlsx)", type=["xlsx", "xls"])
 
-# Determine if AWS credentials are available (explicit or default profile)
-aws_ready = bool(aws_region)
-
-if uploaded_file and aws_ready:
-    datasets = load_and_process(uploaded_file.read(), start_date, end_date)
+if uploaded_file:
+    datasets = load_and_process(uploaded_file.read())
 
     # Show quick stats
     st.subheader("📋 Dataset Overview")
@@ -273,25 +257,18 @@ if uploaded_file and aws_ready:
     st.divider()
 
     if st.button("🚀 Generate Insights", type="primary", use_container_width=True):
-        # Build the Bedrock client, matching the original notebook
+        # Build the Bedrock client with baked-in credentials
         try:
-            if aws_access_key and aws_secret_key:
-                bedrock_runtime = boto3.client(
-                    "bedrock-runtime",
-                    region_name=aws_region,
-                    aws_access_key_id=aws_access_key,
-                    aws_secret_access_key=aws_secret_key,
-                )
-            else:
-                bedrock_runtime = boto3.client(
-                    "bedrock-runtime",
-                    region_name=aws_region,
-                )
+            bedrock_runtime = boto3.client(
+                "bedrock-runtime",
+                region_name=AWS_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            )
         except Exception as e:
             st.error(f"Failed to connect to AWS Bedrock: {e}")
             st.stop()
 
-        date_range_text = f"{start_date} to {end_date}"
         summaries = {}
 
         # ── Business-unit summaries ──
@@ -307,7 +284,6 @@ if uploaded_file and aws_ready:
                 bedrock_runtime,
                 datasets[unit_key],
                 unit_key.replace("_", " ").title(),
-                date_range_text,
             )
             summaries[unit_key] = summary
             with st.expander(unit_label, expanded=False):
@@ -319,7 +295,7 @@ if uploaded_file and aws_ready:
             text="Generating executive summary …",
         )
         st.subheader("📋 Executive Summary")
-        exec_summary = generate_executive_summary(bedrock_runtime, summaries, date_range_text)
+        exec_summary = generate_executive_summary(bedrock_runtime, summaries)
         st.markdown(exec_summary)
 
         # ── Overall insights ──
@@ -328,10 +304,10 @@ if uploaded_file and aws_ready:
             text="Generating overall insights …",
         )
         st.subheader("💡 Overall Insights")
-        insights = generate_overall_insights(bedrock_runtime, datasets["all_coverage"], date_range_text)
+        insights = generate_overall_insights(bedrock_runtime, datasets["all_coverage"])
         st.markdown(insights)
 
         progress.progress(1.0, text="✅ Analysis complete!")
 
-elif not uploaded_file:
+else:
     st.info("Upload an Excel workbook to get started.")
