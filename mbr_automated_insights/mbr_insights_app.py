@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import boto3
+from io import BytesIO
 
 # ──────────────────────────────────────────────────────────────
 # Page config
@@ -61,7 +62,8 @@ BUSINESS_UNITS = [
 @st.cache_data(show_spinner="Loading Excel file …")
 def load_and_process(file_bytes):
     """Read the uploaded Excel and create combined datasets."""
-    xls = pd.ExcelFile(file_bytes)
+    buf = BytesIO(file_bytes)
+    xls = pd.ExcelFile(buf)
     actual_sheets = xls.sheet_names
 
     if len(actual_sheets) < len(SHEET_NAMES):
@@ -73,7 +75,7 @@ def load_and_process(file_bytes):
 
     dataframes = {}
     for i, name in enumerate(SHEET_NAMES):
-        dataframes[name] = pd.read_excel(file_bytes, sheet_name=actual_sheets[i], header=0)
+        dataframes[name] = pd.read_excel(buf, sheet_name=actual_sheets[i], header=0)
 
     # Convert Date columns
     for name, df in dataframes.items():
