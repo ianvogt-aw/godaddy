@@ -516,28 +516,100 @@ def fetch_and_extract(
     return context if context is not None else "ERROR: Mention not found in fetched page"
 
 
-def translate_to_english(text: str) -> str:
+def call_llm(
+    user_message: str,
+    *,
+    system_prompt: str = "",
+    max_tokens: int = 256,
+    llm_config: dict,
+) -> str:
+    """
+    Unified LLM call. Routes to AWS Bedrock (Claude) or OpenAI based on
+    llm_config['provider']. Returns the response text (stripped).
+
+    llm_config keys:
+        provider:           "bedrock" (default) or "openai"
+        bedrock_client:     optional pre-built boto3 client (bedrock-runtime)
+        bedrock_model_id:   defaults to module-level BEDROCK_MODEL_ID
+        openai_api_key:     required when provider == "openai"
+        openai_model_id:    required when provider == "openai"
+    """
+    provider = llm_config.get("provider", "bedrock")
+
+    if provider == "openai":
+        api_key = llm_config.get("openai_api_key", "").strip()
+        model_id = llm_config.get("openai_model_id", "").strip()
+        if not api_key:
+            raise ValueError("OpenAI API key is required")
+        if not model_id:
+            raise ValueError("OpenAI model ID is required")
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "openai package is not installed; add `openai` to requirements.txt"
+            ) from exc
+
+        client = OpenAI(api_key=api_key)
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_message})
+
+        # Newer OpenAI models (gpt-5.x, o-series) require max_completion_tokens;
+        # older models still use max_tokens. Try newer first, fall back if rejected.
+        try:
+            resp = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                max_completion_tokens=max_tokens,
+            )
+        except Exception as exc:
+            if "max_completion_tokens" in str(exc) or "max_tokens" in str(exc):
+                resp = client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                )
+            else:
+                raise
+        return (resp.choices[0].message.content or "").strip()
+
+    # Bedrock Claude (default)
+    bedrock_client = llm_config.get("bedrock_client")
+    if bedrock_client is None:
+        bedrock_client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+    model_id = llm_config.get("bedrock_model_id") or BEDROCK_MODEL_ID
+
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if system_prompt:
+        body["system"] = system_prompt
+
+    resp = bedrock_client.invoke_model(
+        modelId=model_id,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(body),
+    )
+    return json.loads(resp["body"].read())["content"][0]["text"].strip()
+
+
+def translate_to_english(text: str, llm_config: dict) -> str:
     try:
-        bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-        resp = bedrock.invoke_model(
-            modelId=BEDROCK_MODEL_ID,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1024,
-                "messages": [{
-                    "role": "user",
-                    "content": (
-                        "Translate the following text to English. "
-                        "Preserve the Before:/Mention:/After: labels exactly as-is. "
-                        "Return only the translated text, nothing else.\n\n"
-                        f"{text}"
-                    ),
-                }],
-            }),
+        return call_llm(
+            user_message=(
+                "Translate the following text to English. "
+                "Preserve the Before:/Mention:/After: labels exactly as-is. "
+                "Return only the translated text, nothing else.\n\n"
+                f"{text}"
+            ),
+            max_tokens=1024,
+            llm_config=llm_config,
         )
-        return json.loads(resp["body"].read())["content"][0]["text"].strip()
     except Exception as exc:
         logger.warning("Translation failed: %s", exc)
         return text
@@ -610,9 +682,9 @@ Confidence scoring:
 """
 
 
-def classify_mention(evidence: str, bedrock_client, model_id: str) -> dict:
+def classify_mention(evidence: str, llm_config: dict) -> dict:
     """
-    Send evidence text to Claude via Bedrock and return classification dict.
+    Send evidence text to the configured LLM and return classification dict.
     Returns {"classification": "X", "justification": "...", "confidence": N}.
     """
     default_error = {
@@ -621,21 +693,12 @@ def classify_mention(evidence: str, bedrock_client, model_id: str) -> dict:
         "confidence": 90,
     }
     try:
-        resp = bedrock_client.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 256,
-                "system": CLASSIFICATION_SYSTEM_PROMPT,
-                "messages": [{
-                    "role": "user",
-                    "content": f"Classify this evidence:\n\n{evidence}",
-                }],
-            }),
+        raw = call_llm(
+            user_message=f"Classify this evidence:\n\n{evidence}",
+            system_prompt=CLASSIFICATION_SYSTEM_PROMPT,
+            max_tokens=256,
+            llm_config=llm_config,
         )
-        raw = json.loads(resp["body"].read())["content"][0]["text"].strip()
         # Strip markdown fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -882,6 +945,108 @@ st.markdown("""
 st.markdown("# GoDaddy Mention Extractor")
 st.markdown('<p class="subtitle">Upload a CSV or XLSX → extract mention context → download enriched XLSX</p>', unsafe_allow_html=True)
 
+# ── Model Selection ───────────────────────────────────────────────────────────
+OPENAI_MODEL_PRESETS = [
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.2",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "Custom…",
+]
+
+with st.expander("🤖 Model Selection", expanded=False):
+    st.markdown(
+        "<small style='color:#666;font-family:DM Mono,monospace'>"
+        "Choose which LLM powers translation (Step 1) and classification (Step 2). "
+        "Defaults to AWS Bedrock with the configured Claude model.</small>",
+        unsafe_allow_html=True,
+    )
+    llm_provider = st.radio(
+        "LLM Provider",
+        ["AWS Bedrock (Claude)", "OpenAI (ChatGPT)"],
+        horizontal=True,
+        key="llm_provider",
+    )
+
+    openai_api_key_input = ""
+    openai_model_id_input = ""
+
+    if llm_provider == "OpenAI (ChatGPT)":
+        st.markdown(
+            "<small style='color:#888;font-family:DM Mono,monospace'>"
+            "Get a key at <b>platform.openai.com → API keys</b>. "
+            "The key is held in session memory only and never written to disk.</small>",
+            unsafe_allow_html=True,
+        )
+        openai_api_key_input = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            key="openai_api_key",
+            placeholder="sk-…",
+        )
+        oa_col1, oa_col2 = st.columns([1, 1])
+        with oa_col1:
+            openai_model_choice = st.selectbox(
+                "OpenAI Model",
+                OPENAI_MODEL_PRESETS,
+                index=0,
+                key="openai_model_choice",
+            )
+        with oa_col2:
+            if openai_model_choice == "Custom…":
+                openai_model_id_input = st.text_input(
+                    "Custom Model ID",
+                    value="",
+                    key="openai_model_custom",
+                    placeholder="e.g. gpt-5.5-2025-12-01",
+                )
+            else:
+                openai_model_id_input = openai_model_choice
+                st.markdown(
+                    f"<div style='font-family:DM Mono,monospace;font-size:0.8rem;"
+                    f"color:#555;padding-top:1.9rem'>Using <b>{openai_model_id_input}</b></div>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.markdown(
+            f"<small style='color:#888;font-family:DM Mono,monospace'>"
+            f"Bedrock region: <b>{BEDROCK_REGION}</b> · Model: <b>{BEDROCK_MODEL_ID}</b></small>",
+            unsafe_allow_html=True,
+        )
+
+
+def build_llm_config() -> tuple[dict, str | None]:
+    """
+    Build the llm_config dict from current UI / session state.
+    Returns (config, error_message). error_message is None on success.
+    """
+    provider_choice = st.session_state.get("llm_provider", "AWS Bedrock (Claude)")
+    if provider_choice == "OpenAI (ChatGPT)":
+        api_key = st.session_state.get("openai_api_key", "").strip()
+        choice = st.session_state.get("openai_model_choice", "")
+        model_id = (
+            st.session_state.get("openai_model_custom", "").strip()
+            if choice == "Custom…"
+            else choice
+        )
+        if not api_key:
+            return {}, "OpenAI is selected but no API key was provided. Open the Model Selection section and paste your key."
+        if not model_id:
+            return {}, "OpenAI is selected but no model ID was provided."
+        return {
+            "provider": "openai",
+            "openai_api_key": api_key,
+            "openai_model_id": model_id,
+        }, None
+
+    return {
+        "provider": "bedrock",
+        "bedrock_model_id": BEDROCK_MODEL_ID,
+    }, None
+
+
 # ── Form ──────────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("CSV or XLSX File", type=["csv", "xlsx"], label_visibility="visible")
 
@@ -964,6 +1129,12 @@ if run_button:
         st.stop()
     if not url_col_input.strip():
         st.error("Please specify the URL column.")
+        st.stop()
+
+    # Resolve LLM config (only matters if `translate` is on, but validate up-front)
+    llm_config, llm_err = build_llm_config()
+    if translate and llm_err:
+        st.error(llm_err)
         st.stop()
 
     # Read CSV or XLSX into headers + rows
@@ -1073,7 +1244,7 @@ if run_button:
                         f"<small style='font-family:DM Mono,monospace;color:#888'>🌐 Translating ({lang})…</small>",
                         unsafe_allow_html=True,
                     )
-                    result = translate_to_english(result)
+                    result = translate_to_english(result, llm_config)
 
             row[output_col_name] = result
             if result.startswith("ERROR"):
@@ -1213,12 +1384,19 @@ if classify_button:
         if col_name not in out_cl_headers:
             out_cl_headers.append(col_name)
 
-    # ── Initialize Bedrock ───────────────────────────────────────────────────
-    try:
-        bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-    except Exception as exc:
-        st.error(f"Could not connect to AWS Bedrock: {exc}")
+    # ── Initialize LLM config ────────────────────────────────────────────────
+    llm_config, llm_err = build_llm_config()
+    if llm_err:
+        st.error(llm_err)
         st.stop()
+    if llm_config["provider"] == "bedrock":
+        try:
+            llm_config["bedrock_client"] = boto3.client(
+                "bedrock-runtime", region_name=BEDROCK_REGION
+            )
+        except Exception as exc:
+            st.error(f"Could not connect to AWS Bedrock: {exc}")
+            st.stop()
 
     # ── Determine eligible rows ──────────────────────────────────────────────
     # Eligible = has a URL in the URL column (if URL column exists),
@@ -1281,7 +1459,7 @@ if classify_button:
             cl_err += 1
         else:
             # ── Call LLM ─────────────────────────────────────────────────────
-            result = classify_mention(evidence, bedrock, BEDROCK_MODEL_ID)
+            result = classify_mention(evidence, llm_config)
             row[CLASS_COL] = result["classification"]
             row[JUST_COL] = result["justification"]
             row[CONF_COL] = str(result["confidence"])
