@@ -13,6 +13,8 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+from openpyxl import Workbook, load_workbook
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -663,6 +665,77 @@ def normalize_column(col: str, headers: list[str]) -> str | None:
     return None
 
 
+def read_uploaded_table(uploaded_file) -> tuple[list[str], list[dict]]:
+    """
+    Read an uploaded CSV or XLSX file into (headers, rows).
+    `rows` is a list of dicts keyed by header. Returns ([], []) on failure.
+    """
+    name = (getattr(uploaded_file, "name", "") or "").lower()
+    raw = uploaded_file.read()
+
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        try:
+            wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        except Exception as exc:
+            logger.warning("Failed to open xlsx: %s", exc)
+            return [], []
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(rows_iter)
+        except StopIteration:
+            wb.close()
+            return [], []
+        headers = [(str(h).strip() if h is not None else "") for h in header_row]
+        rows: list[dict] = []
+        for r in rows_iter:
+            if r is None:
+                continue
+            if all(v is None or (isinstance(v, str) and not v.strip()) for v in r):
+                continue
+            row_dict = {}
+            for i, h in enumerate(headers):
+                if not h:
+                    continue
+                val = r[i] if i < len(r) else None
+                row_dict[h] = "" if val is None else str(val)
+            rows.append(row_dict)
+        wb.close()
+        return headers, rows
+
+    # CSV path
+    content: str | None = None
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            content = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if content is None:
+        return [], []
+    reader = csv.DictReader(io.StringIO(content))
+    headers = list(reader.fieldnames or [])
+    rows = list(reader)
+    return headers, rows
+
+
+def rows_to_xlsx_bytes(headers: list[str], rows: list[dict]) -> bytes:
+    """
+    Write rows to an .xlsx byte buffer. Uses openpyxl defaults so every
+    row keeps Excel's default row height (no wrap_text, no custom dimensions),
+    which is what the user wants regardless of multi-line cell content.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.append(headers)
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+    buf = io.BytesIO()
+    wb.save(buf)
+    wb.close()
+    return buf.getvalue()
+
+
 def interleave_by_domain(rows: list[dict], url_col: str) -> list[dict]:
     domain_groups: dict[str, list] = {}
     for row in rows:
@@ -807,10 +880,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown("# GoDaddy Mention Extractor")
-st.markdown('<p class="subtitle">Upload a CSV → extract mention context → download enriched CSV</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Upload a CSV or XLSX → extract mention context → download enriched XLSX</p>', unsafe_allow_html=True)
 
 # ── Form ──────────────────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader("CSV File", type=["csv"], label_visibility="visible")
+uploaded_file = st.file_uploader("CSV or XLSX File", type=["csv", "xlsx"], label_visibility="visible")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -887,29 +960,16 @@ run_button = st.button("Extract Mentions")
 # ── Processing ────────────────────────────────────────────────────────────────
 if run_button:
     if not uploaded_file:
-        st.error("Please upload a CSV file first.")
+        st.error("Please upload a CSV or XLSX file first.")
         st.stop()
     if not url_col_input.strip():
         st.error("Please specify the URL column.")
         st.stop()
 
-    # Decode CSV
-    raw = uploaded_file.read()
-    content = None
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            content = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if content is None:
-        st.error("Could not decode CSV. Please re-save it as UTF-8.")
-        st.stop()
-
-    reader = csv.DictReader(io.StringIO(content))
-    headers = list(reader.fieldnames or [])
+    # Read CSV or XLSX into headers + rows
+    headers, rows = read_uploaded_table(uploaded_file)
     if not headers:
-        st.error("CSV appears to have no headers.")
+        st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
         st.stop()
 
     url_col = normalize_column(url_col_input, headers)
@@ -917,9 +977,8 @@ if run_button:
         st.error(f"Column '{url_col_input}' not found. Available: {', '.join(headers)}")
         st.stop()
 
-    rows = list(reader)
     if not rows:
-        st.error("CSV has no data rows.")
+        st.error("File has no data rows.")
         st.stop()
 
     interleaved = interleave_by_domain(rows, url_col)
@@ -1042,11 +1101,7 @@ if run_button:
     # Re-order to original row order
     ordered = [completed.get(id(r), r) for r in rows]
 
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=out_headers, extrasaction="ignore", lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(ordered)
-    csv_bytes = output.getvalue().encode("utf-8-sig")
+    xlsx_bytes = rows_to_xlsx_bytes(out_headers, ordered)
 
     status_text.markdown(
         "<small style='font-family:DM Mono,monospace;color:#1a1a1a'>✓ Done</small>",
@@ -1055,14 +1110,14 @@ if run_button:
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.download_button(
-        label="⬇ Download Enriched CSV",
-        data=csv_bytes,
-        file_name="mentions_output.csv",
-        mime="text/csv",
+        label="⬇ Download Enriched XLSX",
+        data=xlsx_bytes,
+        file_name="mentions_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
     # Store enriched data in session state for Step 2
-    st.session_state["enriched_csv_bytes"] = csv_bytes
+    st.session_state["enriched_rows"] = ordered
     st.session_state["enriched_headers"] = out_headers
     st.session_state["enriched_output_col"] = output_col_name
 
@@ -1075,16 +1130,20 @@ st.markdown(
 )
 
 classify_source = st.radio(
-    "Source CSV",
-    ["Use output from Step 1 above", "Upload a pre-enriched CSV"],
+    "Source file",
+    ["Use output from Step 1 above", "Upload a pre-enriched file"],
     horizontal=True,
     label_visibility="collapsed",
     key="classify_source",
 )
 
 classify_file = None
-if classify_source == "Upload a pre-enriched CSV":
-    classify_file = st.file_uploader("CSV with extracted mentions", type=["csv"], key="classify_upload")
+if classify_source == "Upload a pre-enriched file":
+    classify_file = st.file_uploader(
+        "CSV or XLSX with extracted mentions",
+        type=["csv", "xlsx"],
+        key="classify_upload",
+    )
 
 cl_col1, cl_col2 = st.columns(2)
 with cl_col1:
@@ -1112,34 +1171,28 @@ refetch_errors = st.checkbox(
 classify_button = st.button("Classify Mentions", key="classify_btn")
 
 if classify_button:
-    # ── Load CSV data ────────────────────────────────────────────────────────
-    csv_content = None
+    # ── Load source data ─────────────────────────────────────────────────────
+    cl_headers: list[str] = []
+    cl_rows: list[dict] = []
 
     if classify_source == "Use output from Step 1 above":
-        if "enriched_csv_bytes" not in st.session_state:
-            st.error("No Step 1 output found. Run Extract Mentions first or upload a CSV.")
+        if "enriched_rows" not in st.session_state:
+            st.error("No Step 1 output found. Run Extract Mentions first or upload a file.")
             st.stop()
-        csv_content = st.session_state["enriched_csv_bytes"].decode("utf-8-sig")
+        cl_headers = list(st.session_state["enriched_headers"])
+        # Copy rows so we don't mutate Step 1's stored data
+        cl_rows = [dict(r) for r in st.session_state["enriched_rows"]]
     else:
         if classify_file is None:
-            st.error("Please upload a CSV file.")
+            st.error("Please upload a CSV or XLSX file.")
             st.stop()
-        raw = classify_file.read()
-        for enc in ("utf-8-sig", "cp1252", "latin-1"):
-            try:
-                csv_content = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        if csv_content is None:
-            st.error("Could not decode CSV.")
+        cl_headers, cl_rows = read_uploaded_table(classify_file)
+        if not cl_headers:
+            st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
             st.stop()
 
-    reader = csv.DictReader(io.StringIO(csv_content))
-    cl_headers = list(reader.fieldnames or [])
-    cl_rows = list(reader)
     if not cl_rows:
-        st.error("CSV has no data rows.")
+        st.error("File has no data rows.")
         st.stop()
 
     evidence_col = normalize_column(evidence_col_input, cl_headers)
@@ -1250,12 +1303,8 @@ if classify_button:
             unsafe_allow_html=True,
         )
 
-    # ── Write output CSV ─────────────────────────────────────────────────────
-    cl_output = io.StringIO()
-    cl_writer = csv.DictWriter(cl_output, fieldnames=out_cl_headers, extrasaction="ignore", lineterminator="\n")
-    cl_writer.writeheader()
-    cl_writer.writerows(cl_rows)
-    cl_csv_bytes = cl_output.getvalue().encode("utf-8-sig")
+    # ── Write output XLSX ────────────────────────────────────────────────────
+    cl_xlsx_bytes = rows_to_xlsx_bytes(out_cl_headers, cl_rows)
 
     cl_status.markdown(
         "<small style='font-family:DM Mono,monospace;color:#1a1a1a'>✓ Classification complete</small>",
@@ -1264,9 +1313,9 @@ if classify_button:
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.download_button(
-        label="⬇ Download Classified CSV",
-        data=cl_csv_bytes,
-        file_name="mentions_classified.csv",
-        mime="text/csv",
+        label="⬇ Download Classified XLSX",
+        data=cl_xlsx_bytes,
+        file_name="mentions_classified.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="download_classified",
     )
