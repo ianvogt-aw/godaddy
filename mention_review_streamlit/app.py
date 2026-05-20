@@ -1120,10 +1120,17 @@ with st.expander("🔐 Meltwater Authentication", expanded=False):
         )
 
 st.markdown("<hr>", unsafe_allow_html=True)
-run_button = st.button("Extract Mentions")
 
-# ── Processing ────────────────────────────────────────────────────────────────
+# ── Step 1: Extract Mentions (rerun-resilient) ───────────────────────────────
+# The button press validates inputs, stores everything into session_state, and
+# sets a running flag.  The actual processing loop runs off that flag so that
+# if Streamlit triggers a rerun (e.g. tab hidden → WebSocket reconnect) the
+# loop picks up where it left off instead of silently dying.
+
+run_button = st.button("Extract Mentions", disabled=st.session_state.get("ext_running", False))
+
 if run_button:
+    # ── Validate inputs ──────────────────────────────────────────────────────
     if not uploaded_file:
         st.error("Please upload a CSV or XLSX file first.")
         st.stop()
@@ -1131,13 +1138,11 @@ if run_button:
         st.error("Please specify the URL column.")
         st.stop()
 
-    # Resolve LLM config (only matters if `translate` is on, but validate up-front)
     llm_config, llm_err = build_llm_config()
     if translate and llm_err:
         st.error(llm_err)
         st.stop()
 
-    # Read CSV or XLSX into headers + rows
     headers, rows = read_uploaded_table(uploaded_file)
     if not headers:
         st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
@@ -1154,10 +1159,6 @@ if run_button:
 
     interleaved = interleave_by_domain(rows, url_col)
     out_headers = headers + ([output_col_name] if output_col_name not in headers else [])
-
-    total = len(interleaved)
-    ok_count = 0
-    error_count = 0
 
     # ── Meltwater pre-login (once per run) ───────────────────────────────────
     mw_playwright_cookies: dict | None = None
@@ -1199,19 +1200,81 @@ if run_button:
     elif has_mw_urls and mw_auth_method == "None (use Hit Sentence fallback)":
         st.info("ℹ Meltwater URLs detected — will use Hit Sentence column as fallback for those rows.")
 
-    # Progress UI
+    # ── Snapshot everything into session_state so reruns can resume ───────────
+    st.session_state["ext_running"] = True
+    st.session_state["ext_progress"] = 0
+    st.session_state["ext_ok"] = 0
+    st.session_state["ext_err"] = 0
+    # Store rows by index (not id()) so ordering survives reruns
+    st.session_state["ext_interleaved"] = interleaved
+    st.session_state["ext_original_rows"] = rows
+    st.session_state["ext_headers"] = headers
+    st.session_state["ext_out_headers"] = out_headers
+    st.session_state["ext_url_col"] = url_col
+    st.session_state["ext_output_col"] = output_col_name
+    st.session_state["ext_delay"] = delay
+    st.session_state["ext_translate"] = translate
+    st.session_state["ext_llm_config"] = {k: v for k, v in (llm_config or {}).items() if k != "bedrock_client"}
+    st.session_state["ext_mw_cookie_str"] = mw_cookie_str
+    st.session_state["ext_mw_playwright_cookies"] = mw_playwright_cookies
+    st.session_state["ext_mw_api_token"] = mw_api_token
+    st.session_state["ext_results"] = {}          # idx → result string
+    st.session_state["ext_domain_last_hit"] = {}   # domain → timestamp
+    st.rerun()
+
+# ── Resume / run extraction loop ─────────────────────────────────────────────
+if st.session_state.get("ext_running"):
+    interleaved = st.session_state["ext_interleaved"]
+    original_rows = st.session_state["ext_original_rows"]
+    ext_headers = st.session_state["ext_headers"]
+    out_headers = st.session_state["ext_out_headers"]
+    url_col = st.session_state["ext_url_col"]
+    output_col_name_run = st.session_state["ext_output_col"]
+    ext_delay = st.session_state["ext_delay"]
+    ext_translate = st.session_state["ext_translate"]
+    ext_llm_config = st.session_state["ext_llm_config"]
+    ext_mw_cookie_str = st.session_state["ext_mw_cookie_str"]
+    ext_mw_playwright_cookies = st.session_state["ext_mw_playwright_cookies"]
+    ext_mw_api_token = st.session_state["ext_mw_api_token"]
+    ext_results = st.session_state["ext_results"]
+    domain_last_hit = st.session_state["ext_domain_last_hit"]
+    start_idx = st.session_state["ext_progress"]
+
+    total = len(interleaved)
+    ok_count = st.session_state["ext_ok"]
+    error_count = st.session_state["ext_err"]
+
+    # Rebuild bedrock client if needed (can't be serialised into session_state)
+    if ext_llm_config.get("provider") == "bedrock" and "bedrock_client" not in ext_llm_config:
+        try:
+            ext_llm_config["bedrock_client"] = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        except Exception as exc:
+            st.error(f"Could not reconnect to AWS Bedrock: {exc}")
+            st.session_state["ext_running"] = False
+            st.stop()
+
+    # Cancel button
+    if st.button("⛔ Cancel Extraction", key="cancel_ext"):
+        st.session_state["ext_running"] = False
+        st.warning("Extraction cancelled.")
+        st.rerun()
+
     status_text = st.empty()
-    progress_bar = st.progress(0)
+    progress_bar = st.progress(start_idx / total if total else 0)
     stats_placeholder = st.empty()
 
-    completed: dict[int, dict] = {}
-    domain_last_hit: dict[str, float] = {}
+    # Show stats for already-completed rows
+    if start_idx > 0:
+        status_text.markdown(
+            f"<small style='font-family:DM Mono,monospace;color:#888'>▶ Resuming from row {start_idx+1}/{total}…</small>",
+            unsafe_allow_html=True,
+        )
 
-    for i, row in enumerate(interleaved):
+    for i in range(start_idx, total):
+        row = interleaved[i]
         url = row.get(url_col, "").strip()
         hit_sentence = row.get(HIT_SENTENCE_COL, "").strip()
 
-        # Domain throttle
         if url:
             domain = urlparse(url).netloc
             if domain in domain_last_hit:
@@ -1231,35 +1294,41 @@ if run_button:
             result = fetch_and_extract(
                 url,
                 hit_sentence,
-                mw_cookies_str=mw_cookie_str,
-                mw_playwright_cookies=mw_playwright_cookies,
-                mw_api_token=mw_api_token,
+                mw_cookies_str=ext_mw_cookie_str,
+                mw_playwright_cookies=ext_mw_playwright_cookies,
+                mw_api_token=ext_mw_api_token,
             )
             domain_last_hit[domain] = time.time()
 
-            if translate and result and not result.startswith("ERROR"):
+            if ext_translate and result and not result.startswith("ERROR"):
                 lang = row.get("Language", "").strip().lower()
                 if lang and lang != "english":
                     status_text.markdown(
                         f"<small style='font-family:DM Mono,monospace;color:#888'>🌐 Translating ({lang})…</small>",
                         unsafe_allow_html=True,
                     )
-                    result = translate_to_english(result, llm_config)
+                    result = translate_to_english(result, ext_llm_config)
 
-            row[output_col_name] = result
+            row[output_col_name_run] = result
             if result.startswith("ERROR"):
                 error_count += 1
             else:
                 ok_count += 1
 
             if i < total - 1:
-                time.sleep(delay + random.uniform(0.5, 1.0))
+                time.sleep(ext_delay + random.uniform(0.5, 1.0))
         else:
-            row[output_col_name] = "NO_URL"
+            row[output_col_name_run] = "NO_URL"
 
-        completed[id(row)] = row
+        # ── Persist progress so reruns can resume ────────────────────────────
+        ext_results[i] = row[output_col_name_run]
+        st.session_state["ext_progress"] = i + 1
+        st.session_state["ext_ok"] = ok_count
+        st.session_state["ext_err"] = error_count
+        st.session_state["ext_results"] = ext_results
+        st.session_state["ext_domain_last_hit"] = domain_last_hit
+
         progress_bar.progress((i + 1) / total)
-
         stats_placeholder.markdown(
             f"""<div class="stat-row">
                 <div class="stat-box"><div class="stat-num">{i+1}/{total}</div><div class="stat-label">Processed</div></div>
@@ -1269,9 +1338,16 @@ if run_button:
             unsafe_allow_html=True,
         )
 
-    # Re-order to original row order
-    ordered = [completed.get(id(r), r) for r in rows]
+    # ── Complete — build final output ────────────────────────────────────────
+    # Re-apply results to original row order
+    # Build a mapping: original row index → interleaved index
+    interleaved_id_order = {id(r): idx for idx, r in enumerate(interleaved)}
+    for orig_row in original_rows:
+        il_idx = interleaved_id_order.get(id(orig_row))
+        if il_idx is not None and il_idx in ext_results:
+            orig_row[output_col_name_run] = ext_results[il_idx]
 
+    ordered = original_rows
     xlsx_bytes = rows_to_xlsx_bytes(out_headers, ordered)
 
     status_text.markdown(
@@ -1290,7 +1366,10 @@ if run_button:
     # Store enriched data in session state for Step 2
     st.session_state["enriched_rows"] = ordered
     st.session_state["enriched_headers"] = out_headers
-    st.session_state["enriched_output_col"] = output_col_name
+    st.session_state["enriched_output_col"] = output_col_name_run
+
+    # Clear running state
+    st.session_state["ext_running"] = False
 
 # ── Step 2: Classify Mentions ─────────────────────────────────────────────────
 st.markdown("<hr>", unsafe_allow_html=True)
@@ -1339,7 +1418,7 @@ refetch_errors = st.checkbox(
     key="refetch_errors",
 )
 
-classify_button = st.button("Classify Mentions", key="classify_btn")
+classify_button = st.button("Classify Mentions", key="classify_btn", disabled=st.session_state.get("cl_running", False))
 
 if classify_button:
     # ── Load source data ─────────────────────────────────────────────────────
@@ -1351,7 +1430,6 @@ if classify_button:
             st.error("No Step 1 output found. Run Extract Mentions first or upload a file.")
             st.stop()
         cl_headers = list(st.session_state["enriched_headers"])
-        # Copy rows so we don't mutate Step 1's stored data
         cl_rows = [dict(r) for r in st.session_state["enriched_rows"]]
     else:
         if classify_file is None:
@@ -1372,9 +1450,7 @@ if classify_button:
         st.stop()
 
     classify_url_col = normalize_column(classify_url_col_input, cl_headers)
-    # URL column is optional (only needed for re-fetch)
 
-    # Output column names
     CLASS_COL = "Classification"
     JUST_COL = "Justification"
     CONF_COL = "Confidence"
@@ -1384,23 +1460,11 @@ if classify_button:
         if col_name not in out_cl_headers:
             out_cl_headers.append(col_name)
 
-    # ── Initialize LLM config ────────────────────────────────────────────────
     llm_config, llm_err = build_llm_config()
     if llm_err:
         st.error(llm_err)
         st.stop()
-    if llm_config["provider"] == "bedrock":
-        try:
-            llm_config["bedrock_client"] = boto3.client(
-                "bedrock-runtime", region_name=BEDROCK_REGION
-            )
-        except Exception as exc:
-            st.error(f"Could not connect to AWS Bedrock: {exc}")
-            st.stop()
 
-    # ── Determine eligible rows ──────────────────────────────────────────────
-    # Eligible = has a URL in the URL column (if URL column exists),
-    # or has evidence text in the evidence column
     eligible_indices = []
     for idx, row in enumerate(cl_rows):
         url = row.get(classify_url_col or "", "").strip() if classify_url_col else ""
@@ -1412,15 +1476,75 @@ if classify_button:
         st.error("No eligible rows found.")
         st.stop()
 
+    # ── Snapshot into session_state ──────────────────────────────────────────
+    st.session_state["cl_running"] = True
+    st.session_state["cl_progress"] = 0
+    st.session_state["cl_ok"] = 0
+    st.session_state["cl_err"] = 0
+    st.session_state["cl_rows"] = cl_rows
+    st.session_state["cl_headers"] = cl_headers
+    st.session_state["cl_out_headers"] = out_cl_headers
+    st.session_state["cl_evidence_col"] = evidence_col
+    st.session_state["cl_url_col"] = classify_url_col
+    st.session_state["cl_eligible"] = eligible_indices
+    st.session_state["cl_refetch"] = refetch_errors
+    st.session_state["cl_llm_config"] = {k: v for k, v in llm_config.items() if k != "bedrock_client"}
+    st.session_state["cl_results"] = {}  # step_index → {class, just, conf}
+    st.rerun()
+
+# ── Resume / run classification loop ─────────────────────────────────────────
+if st.session_state.get("cl_running"):
+    cl_rows = st.session_state["cl_rows"]
+    out_cl_headers = st.session_state["cl_out_headers"]
+    evidence_col = st.session_state["cl_evidence_col"]
+    classify_url_col = st.session_state["cl_url_col"]
+    eligible_indices = st.session_state["cl_eligible"]
+    cl_refetch = st.session_state["cl_refetch"]
+    cl_llm_config = st.session_state["cl_llm_config"]
+    cl_saved_results = st.session_state["cl_results"]
+    cl_start = st.session_state["cl_progress"]
+
+    CLASS_COL = "Classification"
+    JUST_COL = "Justification"
+    CONF_COL = "Confidence"
+
     total_cl = len(eligible_indices)
-    cl_ok = 0
-    cl_err = 0
+    cl_ok = st.session_state["cl_ok"]
+    cl_err = st.session_state["cl_err"]
+
+    # Rebuild bedrock client if needed
+    if cl_llm_config.get("provider") == "bedrock" and "bedrock_client" not in cl_llm_config:
+        try:
+            cl_llm_config["bedrock_client"] = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        except Exception as exc:
+            st.error(f"Could not reconnect to AWS Bedrock: {exc}")
+            st.session_state["cl_running"] = False
+            st.stop()
+
+    # Re-apply already-completed results to rows
+    for done_step, saved in cl_saved_results.items():
+        idx = eligible_indices[int(done_step)]
+        cl_rows[idx][CLASS_COL] = saved["classification"]
+        cl_rows[idx][JUST_COL] = saved["justification"]
+        cl_rows[idx][CONF_COL] = saved["confidence"]
+
+    if st.button("⛔ Cancel Classification", key="cancel_cl"):
+        st.session_state["cl_running"] = False
+        st.warning("Classification cancelled.")
+        st.rerun()
 
     cl_status = st.empty()
-    cl_progress = st.progress(0)
+    cl_progress = st.progress(cl_start / total_cl if total_cl else 0)
     cl_stats = st.empty()
 
-    for step, idx in enumerate(eligible_indices):
+    if cl_start > 0:
+        cl_status.markdown(
+            f"<small style='font-family:DM Mono,monospace;color:#888'>▶ Resuming from {cl_start+1}/{total_cl}…</small>",
+            unsafe_allow_html=True,
+        )
+
+    for step in range(cl_start, total_cl):
+        idx = eligible_indices[step]
         row = cl_rows[idx]
         evidence = row.get(evidence_col, "").strip()
         url = row.get(classify_url_col or "", "").strip() if classify_url_col else ""
@@ -1430,15 +1554,13 @@ if classify_button:
             unsafe_allow_html=True,
         )
 
-        # ── Determine what evidence to send ──────────────────────────────────
         is_error_or_blank = (
             not evidence
             or evidence == "NO_URL"
             or evidence.startswith("ERROR")
         )
 
-        if is_error_or_blank and refetch_errors and url.startswith("http"):
-            # Re-fetch the URL
+        if is_error_or_blank and cl_refetch and url.startswith("http"):
             cl_status.markdown(
                 f"<small style='font-family:DM Mono,monospace;color:#888'>🔄 Re-fetching {url[:60]}…</small>",
                 unsafe_allow_html=True,
@@ -1449,7 +1571,6 @@ if classify_button:
                 is_error_or_blank = False
 
         if is_error_or_blank:
-            # Can't classify — mark as E
             row[CLASS_COL] = "E"
             if not evidence or evidence == "NO_URL":
                 row[JUST_COL] = "No evidence text available and no URL to fetch."
@@ -1458,8 +1579,7 @@ if classify_button:
             row[CONF_COL] = "90"
             cl_err += 1
         else:
-            # ── Call LLM ─────────────────────────────────────────────────────
-            result = classify_mention(evidence, llm_config)
+            result = classify_mention(evidence, cl_llm_config)
             row[CLASS_COL] = result["classification"]
             row[JUST_COL] = result["justification"]
             row[CONF_COL] = str(result["confidence"])
@@ -1468,8 +1588,19 @@ if classify_button:
             else:
                 cl_ok += 1
 
-            # Brief delay to avoid Bedrock throttling
             time.sleep(0.3)
+
+        # ── Persist progress ─────────────────────────────────────────────────
+        cl_saved_results[step] = {
+            "classification": row[CLASS_COL],
+            "justification": row[JUST_COL],
+            "confidence": row[CONF_COL],
+        }
+        st.session_state["cl_progress"] = step + 1
+        st.session_state["cl_ok"] = cl_ok
+        st.session_state["cl_err"] = cl_err
+        st.session_state["cl_results"] = cl_saved_results
+        st.session_state["cl_rows"] = cl_rows
 
         cl_progress.progress((step + 1) / total_cl)
         cl_stats.markdown(
@@ -1481,7 +1612,7 @@ if classify_button:
             unsafe_allow_html=True,
         )
 
-    # ── Write output XLSX ────────────────────────────────────────────────────
+    # ── Complete ─────────────────────────────────────────────────────────────
     cl_xlsx_bytes = rows_to_xlsx_bytes(out_cl_headers, cl_rows)
 
     cl_status.markdown(
@@ -1497,3 +1628,5 @@ if classify_button:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="download_classified",
     )
+
+    st.session_state["cl_running"] = False
