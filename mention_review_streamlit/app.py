@@ -6,12 +6,14 @@ import os
 import random
 import re
 import time
+import zipfile
 from urllib.parse import urlparse
 
 import boto3
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from lxml import etree
 
 from openpyxl import Workbook, load_workbook
 
@@ -44,6 +46,8 @@ BEDROCK_MODEL_ID = st.secrets.get(
     "BEDROCK_MODEL_ID",
     os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
 )
+
+EXCLUDED_TABS = {"Hist_Data", "Hist_Calc", "Hist_Stage"}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -814,6 +818,171 @@ def interleave_by_domain(rows: list[dict], url_col: str) -> list[dict]:
     return interleaved
 
 
+def get_xlsx_sheet_names(raw_bytes: bytes) -> list[str]:
+    """Return selectable sheet names from an XLSX, excluding Hist_* tabs."""
+    try:
+        wb = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        names = [n for n in wb.sheetnames if n not in EXCLUDED_TABS]
+        wb.close()
+        return names
+    except Exception as exc:
+        logger.warning("Failed to read sheet names: %s", exc)
+        return []
+
+
+def _build_keep_xf_set(raw_bytes: bytes) -> tuple[set[int], set[int]]:
+    """
+    Parse the xlsx styles XML and return two sets of XF (cell-style) indices:
+    one for orange fills (theme 5 / accent2) and one for purple fills (theme 8 / accent5).
+    Both sets represent rows the user wants to keep.
+    """
+    ORANGE_RGBS = {"FFFBE2D5"}
+    PURPLE_RGBS = {"FFF2CEEF", "FFF2CFEF"}
+    XNS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sns = {"x": XNS}
+
+    with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+        styles_xml = zf.read("xl/styles.xml")
+
+    sroot = etree.fromstring(styles_xml)
+
+    # Classify each fill index as orange, purple, or neither
+    fill_cat: dict[int, str] = {}
+    for i, fill in enumerate(sroot.findall(".//x:fills/x:fill", sns)):
+        pf = fill.find("x:patternFill", sns)
+        if pf is None:
+            continue
+        fg = pf.find("x:fgColor", sns)
+        if fg is None:
+            continue
+        theme = fg.get("theme", "")
+        rgb = fg.get("rgb", "")
+        if theme == "5" or rgb in ORANGE_RGBS:
+            fill_cat[i] = "orange"
+        elif theme == "8" or rgb in PURPLE_RGBS:
+            fill_cat[i] = "purple"
+
+    # Map XF indices → category
+    orange_xfs: set[int] = set()
+    purple_xfs: set[int] = set()
+    for idx, xf in enumerate(sroot.findall(".//x:cellXfs/x:xf", sns)):
+        fill_id = int(xf.get("fillId", 0))
+        cat = fill_cat.get(fill_id)
+        if cat == "orange":
+            orange_xfs.add(idx)
+        elif cat == "purple":
+            purple_xfs.add(idx)
+
+    return orange_xfs, purple_xfs
+
+
+def read_uploaded_table_filtered(
+    uploaded_file,
+    sheet_name: str | None = None,
+) -> tuple[list[str], list[dict]]:
+    """
+    Read an uploaded XLSX, selecting a specific sheet and keeping only rows
+    whose cells are highlighted in orange or purple.  Falls back to the
+    unfiltered `read_uploaded_table` for CSVs or when no sheet is selected.
+    """
+    name = (getattr(uploaded_file, "name", "") or "").lower()
+    raw = uploaded_file.read()
+
+    if not (name.endswith(".xlsx") or name.endswith(".xlsm")) or sheet_name is None:
+        # Reset read pointer and delegate to original reader
+        uploaded_file.seek(0)
+        return read_uploaded_table(uploaded_file)
+
+    # ── Build the set of XF styles that correspond to orange / purple ────────
+    orange_xfs, purple_xfs = _build_keep_xf_set(raw)
+    keep_xfs = orange_xfs | purple_xfs
+
+    # ── Determine the worksheet XML path for the chosen sheet ────────────────
+    XNS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+    sns = {"x": XNS}
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        wb_xml = zf.read("xl/workbook.xml")
+        wb_root = etree.fromstring(wb_xml)
+        rels_xml = zf.read("xl/_rels/workbook.xml.rels")
+        rels_root = etree.fromstring(rels_xml)
+
+        # Map sheet name → rId → file path
+        rid_to_target = {}
+        for rel in rels_root.findall(f"{{{RELS_NS}}}Relationship"):
+            rid_to_target[rel.get("Id")] = rel.get("Target")
+
+        sheet_rid = None
+        for s in wb_root.findall(".//x:sheets/x:sheet", sns):
+            if s.get("name") == sheet_name:
+                ns_r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                sheet_rid = s.get(f"{{{ns_r}}}id")
+                break
+
+        if sheet_rid is None or sheet_rid not in rid_to_target:
+            logger.warning("Sheet '%s' not found in workbook", sheet_name)
+            return [], []
+
+        sheet_path = "xl/" + rid_to_target[sheet_rid].lstrip("/")
+        sheet_xml = zf.read(sheet_path)
+
+    sheet_root = etree.fromstring(sheet_xml)
+    all_rows = sheet_root.findall(f".//{{{XNS}}}sheetData/{{{XNS}}}row")
+
+    if not all_rows:
+        return [], []
+
+    # ── Read header row (row 1) ──────────────────────────────────────────────
+    # Use openpyxl for clean value parsing; we only use the XML for color detection
+    wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    ws = wb[sheet_name]
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        wb.close()
+        return [], []
+    headers = [(str(h).strip() if h is not None else "") for h in header_row]
+
+    # Collect all data rows (openpyxl row index starts at 1; row 1 = header)
+    openpyxl_rows: dict[int, tuple] = {}
+    for row_num, vals in enumerate(rows_iter, start=2):
+        openpyxl_rows[row_num] = vals
+
+    wb.close()
+
+    # ── Identify which data rows are orange or purple via the XML ────────────
+    keep_row_nums: set[int] = set()
+    for xml_row in all_rows:
+        row_num = int(xml_row.get("r"))
+        if row_num == 1:
+            continue  # skip header
+        for cell in xml_row.findall(f"{{{XNS}}}c"):
+            s = int(cell.get("s", 0))
+            if s in keep_xfs:
+                keep_row_nums.add(row_num)
+                break  # one colored cell is enough
+
+    # ── Build output rows ────────────────────────────────────────────────────
+    rows: list[dict] = []
+    for row_num in sorted(keep_row_nums):
+        vals = openpyxl_rows.get(row_num)
+        if vals is None:
+            continue
+        if all(v is None or (isinstance(v, str) and not v.strip()) for v in vals):
+            continue
+        row_dict = {}
+        for i, h in enumerate(headers):
+            if not h:
+                continue
+            val = vals[i] if i < len(vals) else None
+            row_dict[h] = "" if val is None else str(val)
+        rows.append(row_dict)
+
+    return headers, rows
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.markdown("""
@@ -1050,6 +1219,21 @@ def build_llm_config() -> tuple[dict, str | None]:
 # ── Form ──────────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader("CSV or XLSX File", type=["csv", "xlsx"], label_visibility="visible")
 
+# ── Sheet Tab Selector (XLSX only) ───────────────────────────────────────────
+selected_sheet: str | None = None
+if uploaded_file is not None and (uploaded_file.name or "").lower().endswith((".xlsx", ".xlsm")):
+    raw_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+    sheet_names = get_xlsx_sheet_names(raw_bytes)
+    if sheet_names:
+        selected_sheet = st.selectbox(
+            "Excel Sheet Tab",
+            sheet_names,
+            index=0,
+            help="Choose which sheet to process. Only orange (Keep – T1) and purple (Keep – Non-T1) rows will be used.",
+            key="sheet_tab",
+        )
+
 col1, col2 = st.columns(2)
 with col1:
     url_col_input = st.text_input("URL Column", value="Article URL",
@@ -1143,9 +1327,13 @@ if run_button:
         st.error(llm_err)
         st.stop()
 
-    headers, rows = read_uploaded_table(uploaded_file)
+    headers, rows = read_uploaded_table_filtered(uploaded_file, selected_sheet)
     if not headers:
         st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
+        st.stop()
+
+    if not rows and selected_sheet is not None:
+        st.error(f"No orange or purple rows found on sheet '{selected_sheet}'. Check that the sheet contains highlighted rows.")
         st.stop()
 
     url_col = normalize_column(url_col_input, headers)
@@ -1388,12 +1576,25 @@ classify_source = st.radio(
 )
 
 classify_file = None
+classify_selected_sheet: str | None = None
 if classify_source == "Upload a pre-enriched file":
     classify_file = st.file_uploader(
         "CSV or XLSX with extracted mentions",
         type=["csv", "xlsx"],
         key="classify_upload",
     )
+    if classify_file is not None and (classify_file.name or "").lower().endswith((".xlsx", ".xlsm")):
+        cl_raw = classify_file.read()
+        classify_file.seek(0)
+        cl_sheet_names = get_xlsx_sheet_names(cl_raw)
+        if cl_sheet_names:
+            classify_selected_sheet = st.selectbox(
+                "Excel Sheet Tab",
+                cl_sheet_names,
+                index=0,
+                help="Choose which sheet to classify. Only orange and purple rows will be used.",
+                key="classify_sheet_tab",
+            )
 
 cl_col1, cl_col2 = st.columns(2)
 with cl_col1:
@@ -1435,13 +1636,16 @@ if classify_button:
         if classify_file is None:
             st.error("Please upload a CSV or XLSX file.")
             st.stop()
-        cl_headers, cl_rows = read_uploaded_table(classify_file)
+        cl_headers, cl_rows = read_uploaded_table_filtered(classify_file, classify_selected_sheet)
         if not cl_headers:
             st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
             st.stop()
 
     if not cl_rows:
-        st.error("File has no data rows.")
+        if classify_source != "Use output from Step 1 above" and classify_selected_sheet is not None:
+            st.error(f"No orange or purple rows found on sheet '{classify_selected_sheet}'.")
+        else:
+            st.error("File has no data rows.")
         st.stop()
 
     evidence_col = normalize_column(evidence_col_input, cl_headers)
