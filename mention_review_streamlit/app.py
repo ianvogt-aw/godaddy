@@ -47,7 +47,7 @@ BEDROCK_MODEL_ID = st.secrets.get(
     os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
 )
 
-EXCLUDED_TABS = {"Hist_Data", "Hist_Calc", "Hist_Stage"}
+EXCLUDED_TABS = {"Legend", "Hist_Data", "Hist_Calc", "Hist_Stage"}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -1324,8 +1324,8 @@ if uploaded_file is not None and (uploaded_file.name or "").lower().endswith((".
 
 col1, col2 = st.columns(2)
 with col1:
-    url_col_input = st.text_input("URL Column", value="Article URL",
-                                   help="Column header name (e.g. 'Article URL') or letter (e.g. 'B')")
+    url_col_input = st.text_input("URL Column", value="URL",
+                                   help="Column header name (e.g. 'URL') or letter (e.g. 'B')")
 with col2:
     output_col_name = st.text_input("Output Column Name", value="GoDaddy Mentions")
 
@@ -1720,7 +1720,7 @@ with cl_col1:
 with cl_col2:
     classify_url_col_input = st.text_input(
         "URL Column",
-        value="Article URL",
+        value="URL",
         help="Column with article URLs (for re-fetch on error rows)",
         key="classify_url_col",
     )
