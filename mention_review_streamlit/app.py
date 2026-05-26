@@ -916,21 +916,19 @@ def _get_red_row_nums(raw_bytes: bytes, sheet_name: str) -> set[int]:
 
 def get_xlsx_date_range(raw_bytes: bytes, sheet_name: str) -> tuple:
     """
-    Return (min_date, max_date) found in the Date column of *sheet_name*,
-    considering only rows that are NOT marked red (removed).
+    Return (min_date, max_date) found in the Date column of *sheet_name*.
     Returns (None, None) if dates can't be determined.
     """
     import datetime
     try:
-        red_row_nums = _get_red_row_nums(raw_bytes, sheet_name)
-
-        wb = load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=False)
+        wb = load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
         ws = wb[sheet_name]
-        if ws.max_row is None or ws.max_row < 2:
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if header_row is None:
             wb.close()
             return None, None
-        headers = [(str(ws.cell(row=1, column=c).value or "").strip())
-                    for c in range(1, (ws.max_column or 0) + 1)]
+        headers = [(str(h).strip() if h is not None else "") for h in header_row]
         date_idx = None
         for i, h in enumerate(headers):
             if h.lower() == "date":
@@ -939,12 +937,11 @@ def get_xlsx_date_range(raw_bytes: bytes, sheet_name: str) -> tuple:
         if date_idx is None:
             wb.close()
             return None, None
-        date_col = date_idx + 1  # 1-based for openpyxl cell access
         dates = []
-        for r in range(2, ws.max_row + 1):
-            if r in red_row_nums:
+        for vals in rows_iter:
+            if vals is None:
                 continue
-            v = ws.cell(row=r, column=date_col).value
+            v = vals[date_idx] if date_idx < len(vals) else None
             if isinstance(v, datetime.datetime):
                 dates.append(v.date())
             elif isinstance(v, datetime.date):
@@ -972,33 +969,33 @@ def read_uploaded_table_filtered(
     no sheet is selected.
     """
     import datetime
-
+ 
     name = (getattr(uploaded_file, "name", "") or "").lower()
     raw = uploaded_file.read()
-
+ 
     if not (name.endswith(".xlsx") or name.endswith(".xlsm")) or sheet_name is None:
         uploaded_file.seek(0)
         return read_uploaded_table(uploaded_file)
-
+ 
     # ── Identify red rows to discard ─────────────────────────────────────────
     red_row_nums = _get_red_row_nums(raw, sheet_name)
-
+ 
     # ── Read the chosen sheet via openpyxl (read_only=False for reliability) ─
     try:
         wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=False)
     except Exception as exc:
         logger.warning("Failed to open xlsx: %s", exc)
         return [], []
-
+ 
     ws = wb[sheet_name]
     if ws.max_row is None or ws.max_row < 2 or ws.max_column is None:
         wb.close()
         return [], []
-
+ 
     max_col = ws.max_column
     headers = [(str(ws.cell(row=1, column=c).value or "").strip())
                 for c in range(1, max_col + 1)]
-
+ 
     # Find Date column index for date filtering (0-based)
     date_col_idx: int | None = None
     if date_start is not None or date_end is not None:
@@ -1006,20 +1003,20 @@ def read_uploaded_table_filtered(
             if h.lower() == "date":
                 date_col_idx = i
                 break
-
+ 
     rows: list[dict] = []
     for r in range(2, ws.max_row + 1):
         # Skip red "Removed" rows
         if r in red_row_nums:
             continue
-
+ 
         # Read all cell values for this row
         vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-
+ 
         # Skip entirely blank rows
         if all(v is None or (isinstance(v, str) and not v.strip()) for v in vals):
             continue
-
+ 
         # Date range filter
         if date_col_idx is not None:
             cell_val = vals[date_col_idx]
@@ -1034,7 +1031,7 @@ def read_uploaded_table_filtered(
                 continue
             if date_end and cell_date > date_end:
                 continue
-
+ 
         row_dict = {}
         for i, h in enumerate(headers):
             if not h:
@@ -1042,7 +1039,7 @@ def read_uploaded_table_filtered(
             val = vals[i]
             row_dict[h] = "" if val is None else str(val)
         rows.append(row_dict)
-
+ 
     wb.close()
     return headers, rows
 
