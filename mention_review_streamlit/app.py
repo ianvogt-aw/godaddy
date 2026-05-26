@@ -830,14 +830,12 @@ def get_xlsx_sheet_names(raw_bytes: bytes) -> list[str]:
         return []
 
 
-def _build_keep_xf_set(raw_bytes: bytes) -> tuple[set[int], set[int]]:
+def _build_red_xf_set(raw_bytes: bytes) -> set[int]:
     """
-    Parse the xlsx styles XML and return two sets of XF (cell-style) indices:
-    one for orange fills (theme 5 / accent2) and one for purple fills (theme 8 / accent5).
-    Both sets represent rows the user wants to keep.
+    Parse the xlsx styles XML and return the set of XF (cell-style) indices
+    whose fill is solid red (#FF0000).  Rows containing any cell with one of
+    these styles should be discarded (Legend: Red = "Removed").
     """
-    ORANGE_RGBS = {"FFFBE2D5"}
-    PURPLE_RGBS = {"FFF2CEEF", "FFF2CFEF"}
     XNS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     sns = {"x": XNS}
 
@@ -846,8 +844,7 @@ def _build_keep_xf_set(raw_bytes: bytes) -> tuple[set[int], set[int]]:
 
     sroot = etree.fromstring(styles_xml)
 
-    # Classify each fill index as orange, purple, or neither
-    fill_cat: dict[int, str] = {}
+    red_fill_ids: set[int] = set()
     for i, fill in enumerate(sroot.findall(".//x:fills/x:fill", sns)):
         pf = fill.find("x:patternFill", sns)
         if pf is None:
@@ -855,61 +852,40 @@ def _build_keep_xf_set(raw_bytes: bytes) -> tuple[set[int], set[int]]:
         fg = pf.find("x:fgColor", sns)
         if fg is None:
             continue
-        theme = fg.get("theme", "")
         rgb = fg.get("rgb", "")
-        if theme == "5" or rgb in ORANGE_RGBS:
-            fill_cat[i] = "orange"
-        elif theme == "8" or rgb in PURPLE_RGBS:
-            fill_cat[i] = "purple"
+        if rgb == "FFFF0000":
+            red_fill_ids.add(i)
 
-    # Map XF indices → category
-    orange_xfs: set[int] = set()
-    purple_xfs: set[int] = set()
+    red_xfs: set[int] = set()
     for idx, xf in enumerate(sroot.findall(".//x:cellXfs/x:xf", sns)):
         fill_id = int(xf.get("fillId", 0))
-        cat = fill_cat.get(fill_id)
-        if cat == "orange":
-            orange_xfs.add(idx)
-        elif cat == "purple":
-            purple_xfs.add(idx)
+        if fill_id in red_fill_ids:
+            red_xfs.add(idx)
 
-    return orange_xfs, purple_xfs
+    return red_xfs
 
 
-def read_uploaded_table_filtered(
-    uploaded_file,
-    sheet_name: str | None = None,
-) -> tuple[list[str], list[dict]]:
+def _get_red_row_nums(raw_bytes: bytes, sheet_name: str) -> set[int]:
     """
-    Read an uploaded XLSX, selecting a specific sheet and keeping only rows
-    whose cells are highlighted in orange or purple.  Falls back to the
-    unfiltered `read_uploaded_table` for CSVs or when no sheet is selected.
+    Return the set of row numbers in *sheet_name* that contain at least one
+    cell with a red (#FF0000) fill.  These are the "Removed" rows per the
+    workbook Legend and should be discarded.
     """
-    name = (getattr(uploaded_file, "name", "") or "").lower()
-    raw = uploaded_file.read()
-
-    if not (name.endswith(".xlsx") or name.endswith(".xlsm")) or sheet_name is None:
-        # Reset read pointer and delegate to original reader
-        uploaded_file.seek(0)
-        return read_uploaded_table(uploaded_file)
-
-    # ── Build the set of XF styles that correspond to orange / purple ────────
-    orange_xfs, purple_xfs = _build_keep_xf_set(raw)
-    keep_xfs = orange_xfs | purple_xfs
-
-    # ── Determine the worksheet XML path for the chosen sheet ────────────────
     XNS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
     sns = {"x": XNS}
 
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+    red_xfs = _build_red_xf_set(raw_bytes)
+    if not red_xfs:
+        return set()
+
+    with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
         wb_xml = zf.read("xl/workbook.xml")
         wb_root = etree.fromstring(wb_xml)
         rels_xml = zf.read("xl/_rels/workbook.xml.rels")
         rels_root = etree.fromstring(rels_xml)
 
-        # Map sheet name → rId → file path
-        rid_to_target = {}
+        rid_to_target: dict[str, str] = {}
         for rel in rels_root.findall(f"{{{RELS_NS}}}Relationship"):
             rid_to_target[rel.get("Id")] = rel.get("Target")
 
@@ -921,21 +897,96 @@ def read_uploaded_table_filtered(
                 break
 
         if sheet_rid is None or sheet_rid not in rid_to_target:
-            logger.warning("Sheet '%s' not found in workbook", sheet_name)
-            return [], []
+            return set()
 
         sheet_path = "xl/" + rid_to_target[sheet_rid].lstrip("/")
         sheet_xml = zf.read(sheet_path)
 
     sheet_root = etree.fromstring(sheet_xml)
-    all_rows = sheet_root.findall(f".//{{{XNS}}}sheetData/{{{XNS}}}row")
+    red_rows: set[int] = set()
+    for xml_row in sheet_root.findall(f".//{{{XNS}}}sheetData/{{{XNS}}}row"):
+        row_num = int(xml_row.get("r"))
+        for cell in xml_row.findall(f"{{{XNS}}}c"):
+            s = int(cell.get("s", 0))
+            if s in red_xfs:
+                red_rows.add(row_num)
+                break
+    return red_rows
 
-    if not all_rows:
+
+def get_xlsx_date_range(raw_bytes: bytes, sheet_name: str) -> tuple:
+    """
+    Return (min_date, max_date) found in the Date column of *sheet_name*.
+    Returns (None, None) if dates can't be determined.
+    """
+    import datetime
+    try:
+        wb = load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
+        ws = wb[sheet_name]
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if header_row is None:
+            wb.close()
+            return None, None
+        headers = [(str(h).strip() if h is not None else "") for h in header_row]
+        date_idx = None
+        for i, h in enumerate(headers):
+            if h.lower() == "date":
+                date_idx = i
+                break
+        if date_idx is None:
+            wb.close()
+            return None, None
+        dates = []
+        for vals in rows_iter:
+            if vals is None:
+                continue
+            v = vals[date_idx] if date_idx < len(vals) else None
+            if isinstance(v, datetime.datetime):
+                dates.append(v.date())
+            elif isinstance(v, datetime.date):
+                dates.append(v)
+        wb.close()
+        if not dates:
+            return None, None
+        return min(dates), max(dates)
+    except Exception as exc:
+        logger.warning("Could not read date range: %s", exc)
+        return None, None
+
+
+def read_uploaded_table_filtered(
+    uploaded_file,
+    sheet_name: str | None = None,
+    date_start=None,
+    date_end=None,
+) -> tuple[list[str], list[dict]]:
+    """
+    Read an uploaded XLSX, selecting a specific sheet and:
+      1. Discarding any rows marked red (Legend: "Removed").
+      2. Optionally filtering to rows whose Date falls within [date_start, date_end].
+    Falls back to the unfiltered ``read_uploaded_table`` for CSVs or when
+    no sheet is selected.
+    """
+    import datetime
+
+    name = (getattr(uploaded_file, "name", "") or "").lower()
+    raw = uploaded_file.read()
+
+    if not (name.endswith(".xlsx") or name.endswith(".xlsm")) or sheet_name is None:
+        uploaded_file.seek(0)
+        return read_uploaded_table(uploaded_file)
+
+    # ── Identify red rows to discard ─────────────────────────────────────────
+    red_row_nums = _get_red_row_nums(raw, sheet_name)
+
+    # ── Read the chosen sheet via openpyxl ───────────────────────────────────
+    try:
+        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    except Exception as exc:
+        logger.warning("Failed to open xlsx: %s", exc)
         return [], []
 
-    # ── Read header row (row 1) ──────────────────────────────────────────────
-    # Use openpyxl for clean value parsing; we only use the XML for color detection
-    wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
     ws = wb[sheet_name]
     rows_iter = ws.iter_rows(values_only=True)
     try:
@@ -943,35 +994,42 @@ def read_uploaded_table_filtered(
     except StopIteration:
         wb.close()
         return [], []
+
     headers = [(str(h).strip() if h is not None else "") for h in header_row]
 
-    # Collect all data rows (openpyxl row index starts at 1; row 1 = header)
-    openpyxl_rows: dict[int, tuple] = {}
-    for row_num, vals in enumerate(rows_iter, start=2):
-        openpyxl_rows[row_num] = vals
+    # Find Date column index for date filtering
+    date_col_idx: int | None = None
+    if date_start is not None or date_end is not None:
+        for i, h in enumerate(headers):
+            if h.lower() == "date":
+                date_col_idx = i
+                break
 
-    wb.close()
-
-    # ── Identify which data rows are orange or purple via the XML ────────────
-    keep_row_nums: set[int] = set()
-    for xml_row in all_rows:
-        row_num = int(xml_row.get("r"))
-        if row_num == 1:
-            continue  # skip header
-        for cell in xml_row.findall(f"{{{XNS}}}c"):
-            s = int(cell.get("s", 0))
-            if s in keep_xfs:
-                keep_row_nums.add(row_num)
-                break  # one colored cell is enough
-
-    # ── Build output rows ────────────────────────────────────────────────────
     rows: list[dict] = []
-    for row_num in sorted(keep_row_nums):
-        vals = openpyxl_rows.get(row_num)
+    for row_num, vals in enumerate(rows_iter, start=2):
         if vals is None:
             continue
+        # Skip red "Removed" rows
+        if row_num in red_row_nums:
+            continue
+        # Skip entirely blank rows
         if all(v is None or (isinstance(v, str) and not v.strip()) for v in vals):
             continue
+        # Date range filter
+        if date_col_idx is not None:
+            cell_val = vals[date_col_idx] if date_col_idx < len(vals) else None
+            cell_date = None
+            if isinstance(cell_val, datetime.datetime):
+                cell_date = cell_val.date()
+            elif isinstance(cell_val, datetime.date):
+                cell_date = cell_val
+            if cell_date is None:
+                continue  # skip rows without a parseable date
+            if date_start and cell_date < date_start:
+                continue
+            if date_end and cell_date > date_end:
+                continue
+
         row_dict = {}
         for i, h in enumerate(headers):
             if not h:
@@ -980,6 +1038,7 @@ def read_uploaded_table_filtered(
             row_dict[h] = "" if val is None else str(val)
         rows.append(row_dict)
 
+    wb.close()
     return headers, rows
 
 
@@ -1221,18 +1280,45 @@ uploaded_file = st.file_uploader("CSV or XLSX File", type=["csv", "xlsx"], label
 
 # ── Sheet Tab Selector (XLSX only) ───────────────────────────────────────────
 selected_sheet: str | None = None
+filter_date_start = None
+filter_date_end = None
+_xlsx_raw_cache: bytes | None = None
+
 if uploaded_file is not None and (uploaded_file.name or "").lower().endswith((".xlsx", ".xlsm")):
-    raw_bytes = uploaded_file.read()
+    _xlsx_raw_cache = uploaded_file.read()
     uploaded_file.seek(0)
-    sheet_names = get_xlsx_sheet_names(raw_bytes)
+    sheet_names = get_xlsx_sheet_names(_xlsx_raw_cache)
     if sheet_names:
         selected_sheet = st.selectbox(
             "Excel Sheet Tab",
             sheet_names,
             index=0,
-            help="Choose which sheet to process. Only orange (Keep – T1) and purple (Keep – Non-T1) rows will be used.",
+            help="Choose which sheet to process. Rows marked red (Removed) are automatically discarded.",
             key="sheet_tab",
         )
+        # Date range filter
+        if selected_sheet:
+            d_min, d_max = get_xlsx_date_range(_xlsx_raw_cache, selected_sheet)
+            if d_min and d_max:
+                date_col1, date_col2 = st.columns(2)
+                with date_col1:
+                    filter_date_start = st.date_input(
+                        "Start Date",
+                        value=d_min,
+                        min_value=d_min,
+                        max_value=d_max,
+                        help="Include rows on or after this date",
+                        key="filter_date_start",
+                    )
+                with date_col2:
+                    filter_date_end = st.date_input(
+                        "End Date",
+                        value=d_max,
+                        min_value=d_min,
+                        max_value=d_max,
+                        help="Include rows on or before this date",
+                        key="filter_date_end",
+                    )
 
 col1, col2 = st.columns(2)
 with col1:
@@ -1327,13 +1413,16 @@ if run_button:
         st.error(llm_err)
         st.stop()
 
-    headers, rows = read_uploaded_table_filtered(uploaded_file, selected_sheet)
+    headers, rows = read_uploaded_table_filtered(
+        uploaded_file, selected_sheet,
+        date_start=filter_date_start, date_end=filter_date_end,
+    )
     if not headers:
         st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
         st.stop()
 
     if not rows and selected_sheet is not None:
-        st.error(f"No orange or purple rows found on sheet '{selected_sheet}'. Check that the sheet contains highlighted rows.")
+        st.error(f"No rows found on sheet '{selected_sheet}' after filtering. Check that the date range contains data and not all rows are marked red.")
         st.stop()
 
     url_col = normalize_column(url_col_input, headers)
@@ -1577,6 +1666,8 @@ classify_source = st.radio(
 
 classify_file = None
 classify_selected_sheet: str | None = None
+classify_date_start = None
+classify_date_end = None
 if classify_source == "Upload a pre-enriched file":
     classify_file = st.file_uploader(
         "CSV or XLSX with extracted mentions",
@@ -1592,9 +1683,29 @@ if classify_source == "Upload a pre-enriched file":
                 "Excel Sheet Tab",
                 cl_sheet_names,
                 index=0,
-                help="Choose which sheet to classify. Only orange and purple rows will be used.",
+                help="Choose which sheet to classify. Rows marked red are automatically discarded.",
                 key="classify_sheet_tab",
             )
+            if classify_selected_sheet:
+                cl_d_min, cl_d_max = get_xlsx_date_range(cl_raw, classify_selected_sheet)
+                if cl_d_min and cl_d_max:
+                    cl_date_col1, cl_date_col2 = st.columns(2)
+                    with cl_date_col1:
+                        classify_date_start = st.date_input(
+                            "Start Date",
+                            value=cl_d_min,
+                            min_value=cl_d_min,
+                            max_value=cl_d_max,
+                            key="classify_date_start",
+                        )
+                    with cl_date_col2:
+                        classify_date_end = st.date_input(
+                            "End Date",
+                            value=cl_d_max,
+                            min_value=cl_d_min,
+                            max_value=cl_d_max,
+                            key="classify_date_end",
+                        )
 
 cl_col1, cl_col2 = st.columns(2)
 with cl_col1:
@@ -1636,14 +1747,17 @@ if classify_button:
         if classify_file is None:
             st.error("Please upload a CSV or XLSX file.")
             st.stop()
-        cl_headers, cl_rows = read_uploaded_table_filtered(classify_file, classify_selected_sheet)
+        cl_headers, cl_rows = read_uploaded_table_filtered(
+            classify_file, classify_selected_sheet,
+            date_start=classify_date_start, date_end=classify_date_end,
+        )
         if not cl_headers:
             st.error("Could not read the uploaded file. Make sure it's a valid CSV or XLSX with a header row.")
             st.stop()
 
     if not cl_rows:
         if classify_source != "Use output from Step 1 above" and classify_selected_sheet is not None:
-            st.error(f"No orange or purple rows found on sheet '{classify_selected_sheet}'.")
+            st.error(f"No rows found on sheet '{classify_selected_sheet}' after filtering.")
         else:
             st.error("File has no data rows.")
         st.stop()
