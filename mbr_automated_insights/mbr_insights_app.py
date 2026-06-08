@@ -33,6 +33,7 @@ SHEET_NAMES = [
     "agi",
     "airo",
     "ans",
+    "ans open standard",
     "other",
     "brand",
     "finance",
