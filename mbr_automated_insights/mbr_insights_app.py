@@ -14,120 +14,179 @@ st.set_page_config(
 )
 
 st.title("📊 Media Coverage Insights Generator")
-st.markdown("Upload your prepared Excel workbook and let Claude generate business-unit summaries, an executive summary, and strategic insights — all in one click.")
+st.markdown(
+    "Upload the GoDaddy IC Data workbook and let Claude generate "
+    "business-unit summaries, an executive summary, and strategic "
+    "insights — all in one click."
+)
 
 st.info(
-    "**⚠️ Data Preparation Required:** This application assumes you are uploading the following: "
-    "a version of the GoDaddy Grid with only relevant data. This means you must save a copy of "
-    "the grid with only coverage data from the month of interest (delete scrubbed rows + old "
-    "coverage, use sorting to make this easy)."
+    "**⚠️ Data Preparation Required:** This application assumes you are uploading "
+    "a version of the GoDaddy IC Data grid with only relevant coverage data. Save a "
+    "copy of the grid with only coverage from the month of interest (delete scrubbed "
+    "rows + old coverage — use sorting to make this easy)."
 )
 
 # ──────────────────────────────────────────────────────────────
-# Hardcoded sheet → internal-name mapping (order matters)
+# Sheet-name → internal-key mapping  (matched by substring)
+#
+# Each tuple is (substring_to_match, internal_key).
+# Matching is case-insensitive and checks whether the substring
+# appears anywhere in the actual Excel sheet name, so small
+# naming variations across yearly files are handled automatically.
 # ──────────────────────────────────────────────────────────────
-SHEET_NAMES = [
-    "legend",
-    "small_business_research_lab",
-    "commerce",
-    "agi",
-    "airo",
-    "ans",
-    "other",
-    "brand",
-    "finance",
-    "aman_bhutani",
-    "gourav_pani",
-    "kasturu_mudulodu",
-    "mark_mccaffrey",
-    "jared_sine",
-    "general",
+SHEET_MAP = [
+    ("gdsbrl",              "small_business_research_lab"),
+    ("commerce",            "commerce"),
+    ("agi",                 "agi"),
+    ("airo",                "airo"),
+    ("ans open standard",   "ans_open_standard"),   # must precede generic "ans"
+    ("ans",                 "ans"),
+    ("other",               "other"),
+    ("brand identity",      "_skip_brand_identity"), # ignore Brand Identity (v2)
+    ("brand",               "brand"),
+    ("finance + int",       "finance"),
+    ("finance",             "finance"),              # fallback label
+    ("aman bhutani",        "aman_bhutani"),
+    ("gourav pani",         "gourav_pani"),
+    ("kasturi mudulodu",    "kasturi_mudulodu"),
+    ("mark mccaffrey",      "mark_mccaffrey"),
+    ("jared sine",          "jared_sine"),
+    ("travis muhlestein",   "travis_muhlestein"),
+    ("demetria",            "demetria"),
+    ("berea schaffer",      "berea_schaffer"),
+    ("general",             "general"),
 ]
 
 COLUMNS_TO_KEEP = ["Date", "Title", "Hit Sentence"]
 
+# ──────────────────────────────────────────────────────────────
+# Business-unit definitions
+#
+# Each entry: (internal_key, display_label, list_of_source_keys)
+# If source_keys is None the key is read directly from the
+# parsed sheets dict; otherwise sources are concatenated.
+# ──────────────────────────────────────────────────────────────
 BUSINESS_UNITS = [
-    ("small_business_research_lab", "🔬 Small Business Research Lab"),
-    ("product", "🏭 Product"),
-    ("brand", "🎨 Brand"),
-    ("executive", "👔 Executive"),
-    ("financial", "💰 Financial"),
-    ("corporate", "🏢 Corporate"),
+    ("small_business_research_lab", "🔬 Small Business Research Lab", None),
+    ("product", "🏭 Product", ["commerce", "agi", "airo", "ans", "other"]),
+    ("ans_open_standard", "🌐 ANS Open Standard", None),
+    ("brand", "🎨 Brand", None),
+    (
+        "thought_leadership",
+        "👔 Thought Leadership",
+        [
+            "aman_bhutani",
+            "gourav_pani",
+            "kasturi_mudulodu",
+            "mark_mccaffrey",
+            "jared_sine",
+            "travis_muhlestein",
+            "demetria",
+            "berea_schaffer",
+        ],
+    ),
+    ("financial", "💰 Financial", ["finance"]),
+    (
+        "corporate",
+        "🏢 Corporate",
+        [
+            "brand",
+            "aman_bhutani",
+            "gourav_pani",
+            "kasturi_mudulodu",
+            "mark_mccaffrey",
+            "jared_sine",
+            "travis_muhlestein",
+            "demetria",
+            "berea_schaffer",
+            "finance",
+        ],
+    ),
 ]
 
 
 # ──────────────────────────────────────────────────────────────
 # Data helpers
 # ──────────────────────────────────────────────────────────────
+def _match_sheet(sheet_name: str) -> str | None:
+    """Return the internal key for a given Excel sheet name, or None."""
+    lower = sheet_name.lower()
+    for substring, key in SHEET_MAP:
+        if substring in lower:
+            return key
+    return None
+
+
 @st.cache_data(show_spinner="Loading Excel file …")
-def load_and_process(file_bytes):
-    """Read the uploaded Excel and create combined datasets."""
+def load_and_process(file_bytes: bytes) -> dict[str, pd.DataFrame]:
+    """Read the uploaded Excel and build combined datasets."""
     buf = BytesIO(file_bytes)
     xls = pd.ExcelFile(buf)
-    actual_sheets = xls.sheet_names
 
-    if len(actual_sheets) < len(SHEET_NAMES):
-        st.error(
-            f"Expected at least {len(SHEET_NAMES)} sheets but found {len(actual_sheets)}. "
-            "Please upload the correct workbook."
-        )
-        st.stop()
+    # ── Parse individual sheets by name ──
+    raw: dict[str, pd.DataFrame] = {}
+    matched_keys: set[str] = set()
 
-    dataframes = {}
-    for i, name in enumerate(SHEET_NAMES):
-        dataframes[name] = pd.read_excel(buf, sheet_name=actual_sheets[i], header=0)
-
-    # Convert Date columns
-    for name, df in dataframes.items():
+    for sheet_name in xls.sheet_names:
+        key = _match_sheet(sheet_name)
+        if key is None or key.startswith("_skip"):
+            continue
+        if key in matched_keys:
+            # Duplicate match — skip (first match wins)
+            continue
+        matched_keys.add(key)
+        df = pd.read_excel(buf, sheet_name=sheet_name, header=0)
         if "Date" in df.columns:
-            dataframes[name]["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        raw[key] = df
 
-    # Helper to safely select columns
-    def cols(df):
+    # Warn about any critical sheets that were not found
+    expected = {
+        "small_business_research_lab", "commerce", "agi", "airo", "ans",
+        "ans_open_standard", "other", "brand", "finance",
+        "aman_bhutani", "gourav_pani", "kasturi_mudulodu",
+        "mark_mccaffrey", "jared_sine",
+        "travis_muhlestein", "demetria", "berea_schaffer",
+    }
+    missing = expected - set(raw.keys())
+    if missing:
+        st.warning(
+            f"The following expected sheets were not matched: "
+            f"{', '.join(sorted(missing))}. They will be treated as empty."
+        )
+
+    # Helper — safely select columns and return a (possibly empty) DF
+    def cols(key: str) -> pd.DataFrame:
+        if key not in raw:
+            return pd.DataFrame(columns=COLUMNS_TO_KEEP)
+        df = raw[key]
         return df[[c for c in COLUMNS_TO_KEEP if c in df.columns]]
 
-    # Build combined datasets
-    small_business_research_lab = cols(dataframes["small_business_research_lab"])
+    # ── Build combined datasets for each business unit ──
+    datasets: dict[str, pd.DataFrame] = {}
+    for unit_key, _label, sources in BUSINESS_UNITS:
+        if sources is None:
+            datasets[unit_key] = cols(unit_key)
+        else:
+            datasets[unit_key] = pd.concat(
+                [cols(s) for s in sources], ignore_index=True
+            )
 
-    product = pd.concat(
-        [cols(dataframes[n]) for n in ("commerce", "agi", "airo", "ans", "other")],
-        ignore_index=True,
+    # ── All-coverage union (for article counts / overview) ──
+    datasets["all_coverage"] = (
+        pd.concat(
+            [cols(k) for k in raw if not k.startswith("_skip") and k != "general"],
+            ignore_index=True,
+        )
+        .drop_duplicates()
     )
-
-    brand = cols(dataframes["brand"])
-
-    executive = pd.concat(
-        [cols(dataframes[n]) for n in ("aman_bhutani", "gourav_pani", "kasturu_mudulodu", "mark_mccaffrey", "jared_sine")],
-        ignore_index=True,
-    )
-
-    financial = cols(dataframes["finance"])
-
-    corporate = pd.concat(
-        [cols(dataframes[n]) for n in ("brand", "aman_bhutani", "gourav_pani", "kasturu_mudulodu", "mark_mccaffrey", "finance", "general")],
-        ignore_index=True,
-    )
-
-    all_coverage = pd.concat(
-        [small_business_research_lab, product, brand, executive, financial, cols(dataframes["general"])],
-        ignore_index=True,
-    ).drop_duplicates()
-
-    datasets = {
-        "small_business_research_lab": small_business_research_lab,
-        "product": product,
-        "brand": brand,
-        "executive": executive,
-        "financial": financial,
-        "corporate": corporate,
-        "all_coverage": all_coverage,
-    }
 
     return datasets
 
 
 # ──────────────────────────────────────────────────────────────
-# AWS Bedrock configuration  (read from .streamlit/secrets.toml)
+# AWS Bedrock configuration
 # ──────────────────────────────────────────────────────────────
 AWS_REGION = st.secrets["BEDROCK_REGION"]
 AWS_ACCESS_KEY_ID = st.secrets["AWS_ACCESS_KEY_ID"]
@@ -136,39 +195,35 @@ CLAUDE_MODEL_ID = st.secrets["BEDROCK_MODEL_ID"]
 
 
 # ──────────────────────────────────────────────────────────────
-# LLM helpers  (matches original notebook's Bedrock calls)
+# LLM helpers
 # ──────────────────────────────────────────────────────────────
-def call_claude(bedrock_client, prompt, max_tokens=400):
-    """Invoke Claude via AWS Bedrock, matching the original notebook pattern."""
+def call_claude(bedrock_client, prompt: str, max_tokens: int = 400) -> str:
+    """Invoke Claude via AWS Bedrock."""
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.5,
     })
-
     response = bedrock_client.invoke_model(
         modelId=CLAUDE_MODEL_ID,
         contentType="application/json",
         accept="application/json",
         body=body,
     )
-
     result = json.loads(response["body"].read())
     return result["content"][0]["text"]
 
 
-def generate_coverage_summary(client, df, unit_name):
+def generate_coverage_summary(client, df: pd.DataFrame, unit_name: str) -> str:
+    """Generate a BU-level coverage summary."""
     coverage_data = df[["Date", "Title", "Hit Sentence"]].to_string(index=False)
-    min_date = df["Date"].min()
-    max_date = df["Date"].max()
-    date_range = f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}" if pd.notna(min_date) else "N/A"
-    prompt = f"""You are analyzing media coverage data for the {unit_name} business unit of GoDaddy.
+    min_date, max_date = df["Date"].min(), df["Date"].max()
+    date_range = (
+        f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}"
+        if pd.notna(min_date) else "N/A"
+    )
+    prompt = f"""You are analyzing media coverage data for the {unit_name} area of GoDaddy.
 
 Dataset: {unit_name}
 Total articles: {len(df)}
@@ -189,18 +244,20 @@ GUIDELINES:
     return call_claude(client, prompt, max_tokens=300)
 
 
-def generate_executive_summary(client, summaries):
+def generate_executive_summary(client, summaries: dict[str, str]) -> str:
+    """Synthesize individual BU summaries into an executive overview."""
     summaries_text = "\n\n".join(
-        [f"{name.upper()}:\n{summary}" for name, summary in summaries.items()]
+        f"{name.replace('_', ' ').upper()}:\n{summary}"
+        for name, summary in summaries.items()
     )
-    prompt = f"""You are creating an executive summary of media coverage of GoDaddy across all business units.
+    prompt = f"""You are creating an executive summary of media coverage of GoDaddy across all business units and coverage areas.
 
-Below are summaries of coverage from each business unit:
+Below are summaries of coverage from each area:
 
 {summaries_text}
 
 Please create a concise executive summary (4-6 bullet points, ~150-200 words) that:
-- Synthesizes the key themes across all business units
+- Synthesizes the key themes across all coverage areas
 - Highlights the most significant trends or patterns
 - Provides a holistic view of the organization's media presence
 - Notes any notable differences or commonalities between the coverage areas
@@ -210,56 +267,72 @@ Keep the summary factual and focused on what the data showed."""
     return call_claude(client, prompt, max_tokens=400)
 
 
-def generate_overall_insights(client, all_coverage_df):
-    coverage_data = all_coverage_df[["Date", "Title", "Hit Sentence"]].to_string(index=False)
-    min_date = all_coverage_df["Date"].min()
-    max_date = all_coverage_df["Date"].max()
-    date_range = f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}" if pd.notna(min_date) else "N/A"
-    prompt = f"""You are analyzing ALL media coverage data for GoDaddy for the period {date_range}.
+def generate_overall_insights(client, summaries: dict[str, str]) -> str:
+    """Generate high-level strategic insights from the full set of section summaries."""
+    summaries_text = "\n\n".join(
+        f"{name.replace('_', ' ').upper()}:\n{summary}"
+        for name, summary in summaries.items()
+    )
+    prompt = f"""You are a senior media strategist reviewing ALL coverage insights generated for GoDaddy across every business unit and coverage area.
 
-Total articles: {len(all_coverage_df)}
+Below are the individual section summaries that were produced:
 
-Here is the complete coverage data:
-{coverage_data}
+{summaries_text}
 
-Please generate exactly THREE strategic insights about the overall media coverage. Format your response as three bullet points starting with asterisks (*).
+Please generate THREE to FIVE high-level strategic insights that synthesize
+patterns across the entire grid. Format your response as bullet points
+starting with asterisks (*).
 
 Each insight should:
 - Be one concise sentence or two short sentences
-- Focus on high-level patterns, trends, or notable coverage drivers
-- Include specific details like product launches, campaigns, research initiatives, or themes
-- Reference specific coverage examples
-- If relevant, mention volume changes, geographic reach, or coverage quality
+- Surface cross-cutting patterns, trends, or narrative arcs that span
+  multiple coverage areas
+- Reference specific themes, product launches, campaigns, or executive
+  visibility where relevant
+- Call out opportunities or risks visible only at the aggregate level
+  (e.g. narrative concentration, coverage gaps, message alignment)
 
-Generate the three insights now, formatted as bullet points."""
-    return call_claude(client, prompt, max_tokens=400)
+Do NOT simply repeat individual section summaries — your value is in
+connecting the dots between them."""
+    return call_claude(client, prompt, max_tokens=500)
 
 
 # ──────────────────────────────────────────────────────────────
-# Sidebar — reference info only
+# Sidebar
 # ──────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("ℹ️ Reference")
-    st.caption("**Expected sheets (first 15, in order):** " + ", ".join(SHEET_NAMES))
+    st.markdown("**Insight sections generated:**")
+    for _key, label, _src in BUSINESS_UNITS:
+        st.caption(label)
+    st.divider()
+    st.caption(
+        "Sheets are matched by name (case-insensitive substring), "
+        "so column order or extra tabs won't break parsing."
+    )
 
 # ──────────────────────────────────────────────────────────────
 # Main area — file upload + run
 # ──────────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader("Upload your Excel workbook (.xlsx)", type=["xlsx", "xls"])
+uploaded_file = st.file_uploader(
+    "Upload your GoDaddy IC Data workbook (.xlsx)", type=["xlsx", "xls"]
+)
 
 if uploaded_file:
     datasets = load_and_process(uploaded_file.read())
 
-    # Show quick stats
+    # Quick stats
     st.subheader("📋 Dataset Overview")
-    stat_cols = st.columns(len(datasets))
-    for col, (name, df) in zip(stat_cols, datasets.items()):
-        col.metric(name.replace("_", " ").title(), f"{len(df)} rows")
+    display_units = [(k, l) for k, l, _ in BUSINESS_UNITS]
+    stat_cols = st.columns(len(display_units))
+    for col, (key, label) in zip(stat_cols, display_units):
+        n = len(datasets.get(key, []))
+        col.metric(label.split(" ", 1)[1], f"{n:,} rows")
 
     st.divider()
 
     if st.button("🚀 Generate Insights", type="primary", use_container_width=True):
-        # Build the Bedrock client with baked-in credentials
+        # ── Bedrock client ──
         try:
             bedrock_runtime = boto3.client(
                 "bedrock-runtime",
@@ -271,21 +344,29 @@ if uploaded_file:
             st.error(f"Failed to connect to AWS Bedrock: {e}")
             st.stop()
 
-        summaries = {}
+        summaries: dict[str, str] = {}
+        total_steps = len(BUSINESS_UNITS) + 2  # +1 exec summary, +1 overall
 
         # ── Business-unit summaries ──
-        st.subheader("📊 Business Unit Summaries")
+        st.subheader("📊 Coverage Area Summaries")
         progress = st.progress(0, text="Starting analysis …")
 
-        for idx, (unit_key, unit_label) in enumerate(BUSINESS_UNITS):
+        for idx, (unit_key, unit_label, _sources) in enumerate(BUSINESS_UNITS):
             progress.progress(
-                (idx) / (len(BUSINESS_UNITS) + 2),
+                idx / total_steps,
                 text=f"Summarizing {unit_label} …",
             )
+            df = datasets[unit_key]
+            if df.empty:
+                summaries[unit_key] = "_No coverage data for this period._"
+                with st.expander(unit_label, expanded=False):
+                    st.markdown("_No coverage data for this period._")
+                continue
+
             summary = generate_coverage_summary(
                 bedrock_runtime,
-                datasets[unit_key],
-                unit_key.replace("_", " ").title(),
+                df,
+                unit_label.split(" ", 1)[1],  # drop emoji prefix
             )
             summaries[unit_key] = summary
             with st.expander(unit_label, expanded=False):
@@ -293,23 +374,23 @@ if uploaded_file:
 
         # ── Executive summary ──
         progress.progress(
-            (len(BUSINESS_UNITS)) / (len(BUSINESS_UNITS) + 2),
+            len(BUSINESS_UNITS) / total_steps,
             text="Generating executive summary …",
         )
         st.subheader("📋 Executive Summary")
         exec_summary = generate_executive_summary(bedrock_runtime, summaries)
         st.markdown(exec_summary)
 
-        # ── Overall insights ──
+        # ── Overall insights (synthesized from section summaries) ──
         progress.progress(
-            (len(BUSINESS_UNITS) + 1) / (len(BUSINESS_UNITS) + 2),
+            (len(BUSINESS_UNITS) + 1) / total_steps,
             text="Generating overall insights …",
         )
         st.subheader("💡 Overall Insights")
-        insights = generate_overall_insights(bedrock_runtime, datasets["all_coverage"])
+        insights = generate_overall_insights(bedrock_runtime, summaries)
         st.markdown(insights)
 
         progress.progress(1.0, text="✅ Analysis complete!")
 
 else:
-    st.info("Upload an Excel workbook to get started.")
+    st.info("Upload the GoDaddy IC Data workbook to get started.")
