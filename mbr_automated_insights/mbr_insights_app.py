@@ -1,8 +1,10 @@
 import streamlit as st
 import pandas as pd
+import openpyxl
 import json
 import boto3
 from io import BytesIO
+from datetime import date
 
 # ──────────────────────────────────────────────────────────────
 # Page config
@@ -21,10 +23,9 @@ st.markdown(
 )
 
 st.info(
-    "**⚠️ Data Preparation Required:** This application assumes you are uploading "
-    "a version of the GoDaddy IC Data grid with only relevant coverage data. Save a "
-    "copy of the grid with only coverage from the month of interest (delete scrubbed "
-    "rows + old coverage — use sorting to make this easy)."
+    "**How it works:** Upload the full GoDaddy IC Data workbook — red-highlighted "
+    "(scrubbed) rows are automatically discarded, and you can narrow the date range "
+    "to focus on a specific month or period. No manual data prep required."
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -34,19 +35,21 @@ st.info(
 # Matching is case-insensitive and checks whether the substring
 # appears anywhere in the actual Excel sheet name, so small
 # naming variations across yearly files are handled automatically.
+# ORDER MATTERS: more-specific substrings must come before
+# less-specific ones (e.g. "ans open standard" before "ans").
 # ──────────────────────────────────────────────────────────────
 SHEET_MAP = [
     ("gdsbrl",              "small_business_research_lab"),
     ("commerce",            "commerce"),
     ("agi",                 "agi"),
     ("airo",                "airo"),
-    ("ans open standard",   "ans_open_standard"),   # must precede generic "ans"
+    ("ans open standard",   "ans_open_standard"),
     ("ans",                 "ans"),
     ("other",               "other"),
-    ("brand identity",      "_skip_brand_identity"), # ignore Brand Identity (v2)
+    ("brand identity",      "_skip_brand_identity"),
     ("brand",               "brand"),
     ("finance + int",       "finance"),
-    ("finance",             "finance"),              # fallback label
+    ("finance",             "finance"),
     ("aman bhutani",        "aman_bhutani"),
     ("gourav pani",         "gourav_pani"),
     ("kasturi mudulodu",    "kasturi_mudulodu"),
@@ -105,6 +108,9 @@ BUSINESS_UNITS = [
     ),
 ]
 
+# Red-fill color code used in the IC Data grid to mark scrubbed rows
+_RED_RGB = "FFFF0000"
+
 
 # ──────────────────────────────────────────────────────────────
 # Data helpers
@@ -118,30 +124,92 @@ def _match_sheet(sheet_name: str) -> str | None:
     return None
 
 
-@st.cache_data(show_spinner="Loading Excel file …")
-def load_and_process(file_bytes: bytes) -> dict[str, pd.DataFrame]:
-    """Read the uploaded Excel and build combined datasets."""
-    buf = BytesIO(file_bytes)
-    xls = pd.ExcelFile(buf)
+def _is_red_fill(fill) -> bool:
+    """Check whether an openpyxl cell fill is red (FFFF0000, solid)."""
+    if fill.patternType != "solid":
+        return False
+    fg = fill.fgColor
+    if fg is None or fg.type != "rgb":
+        return False
+    try:
+        return fg.rgb == _RED_RGB
+    except Exception:
+        return False
 
-    # ── Parse individual sheets by name ──
+
+@st.cache_data(show_spinner="Loading workbook and filtering red-highlighted rows …")
+def load_and_process(file_bytes: bytes) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
+    """Single-pass load: extract data via openpyxl while auto-discarding
+    rows whose Date cell is highlighted red.
+
+    Returns
+    -------
+    datasets : dict mapping unit keys → DataFrames (columns: Date, Title, Hit Sentence)
+    red_counts : dict mapping sheet internal keys → number of red rows discarded
+    """
+    buf = BytesIO(file_bytes)
+    wb = openpyxl.load_workbook(buf, data_only=True)
+
     raw: dict[str, pd.DataFrame] = {}
+    red_counts: dict[str, int] = {}
     matched_keys: set[str] = set()
 
-    for sheet_name in xls.sheet_names:
+    for sheet_name in wb.sheetnames:
         key = _match_sheet(sheet_name)
-        if key is None or key.startswith("_skip"):
-            continue
-        if key in matched_keys:
-            # Duplicate match — skip (first match wins)
+        if key is None or key.startswith("_skip") or key in matched_keys:
             continue
         matched_keys.add(key)
-        df = pd.read_excel(buf, sheet_name=sheet_name, header=0)
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        raw[key] = df
 
-    # Warn about any critical sheets that were not found
+        ws = wb[sheet_name]
+
+        # -- Read header row --------------------------------------------------
+        header_cells = next(ws.iter_rows(min_row=1, max_row=1, values_only=False), None)
+        if header_cells is None:
+            raw[key] = pd.DataFrame(columns=COLUMNS_TO_KEEP)
+            red_counts[key] = 0
+            continue
+
+        headers = [c.value for c in header_cells]
+
+        # Locate the Date column for red-fill detection
+        date_col_idx: int | None = None
+        for i, h in enumerate(headers):
+            if h == "Date":
+                date_col_idx = i
+                break
+
+        # -- Single pass: collect data rows, skip red-highlighted ones ---------
+        kept_rows: list[list] = []
+        red = 0
+        for row in ws.iter_rows(min_row=2, values_only=False):
+            if date_col_idx is not None:
+                date_cell = row[date_col_idx]
+                if _is_red_fill(date_cell.fill):
+                    red += 1
+                    continue
+            kept_rows.append([c.value for c in row])
+
+        df = pd.DataFrame(kept_rows, columns=headers) if kept_rows else pd.DataFrame(columns=headers)
+        if "Date" in df.columns:
+            # Some cells store dates as Excel serial numbers (ints)
+            # rather than datetime objects — normalize both forms.
+            _EXCEL_EPOCH = pd.Timestamp("1899-12-30")
+            def _to_dt(val):
+                if isinstance(val, (int, float)) and val > 0:
+                    try:
+                        return _EXCEL_EPOCH + pd.Timedelta(days=int(val))
+                    except Exception:
+                        return pd.NaT
+                return val
+            df["Date"] = df["Date"].apply(_to_dt)
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+        raw[key] = df
+        red_counts[key] = red
+
+    wb.close()
+
+    # ── Warn about missing sheets ──
     expected = {
         "small_business_research_lab", "commerce", "agi", "airo", "ans",
         "ans_open_standard", "other", "brand", "finance",
@@ -156,14 +224,14 @@ def load_and_process(file_bytes: bytes) -> dict[str, pd.DataFrame]:
             f"{', '.join(sorted(missing))}. They will be treated as empty."
         )
 
-    # Helper — safely select columns and return a (possibly empty) DF
-    def cols(key: str) -> pd.DataFrame:
-        if key not in raw:
+    # ── Helper: select analysis columns ──
+    def cols(k: str) -> pd.DataFrame:
+        if k not in raw:
             return pd.DataFrame(columns=COLUMNS_TO_KEEP)
-        df = raw[key]
+        df = raw[k]
         return df[[c for c in COLUMNS_TO_KEEP if c in df.columns]]
 
-    # ── Build combined datasets for each business unit ──
+    # ── Build combined datasets ──
     datasets: dict[str, pd.DataFrame] = {}
     for unit_key, _label, sources in BUSINESS_UNITS:
         if sources is None:
@@ -173,7 +241,6 @@ def load_and_process(file_bytes: bytes) -> dict[str, pd.DataFrame]:
                 [cols(s) for s in sources], ignore_index=True
             )
 
-    # ── All-coverage union (for article counts / overview) ──
     datasets["all_coverage"] = (
         pd.concat(
             [cols(k) for k in raw if not k.startswith("_skip") and k != "general"],
@@ -182,7 +249,25 @@ def load_and_process(file_bytes: bytes) -> dict[str, pd.DataFrame]:
         .drop_duplicates()
     )
 
-    return datasets
+    return datasets, red_counts
+
+
+def apply_date_filter(
+    datasets: dict[str, pd.DataFrame],
+    start: date,
+    end: date,
+) -> dict[str, pd.DataFrame]:
+    """Return a shallow copy of datasets with rows filtered to [start, end]."""
+    s = pd.Timestamp(start)
+    e = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    filtered: dict[str, pd.DataFrame] = {}
+    for key, df in datasets.items():
+        if "Date" in df.columns and not df.empty:
+            mask = df["Date"].between(s, e)
+            filtered[key] = df.loc[mask].reset_index(drop=True)
+        else:
+            filtered[key] = df
+    return filtered
 
 
 # ──────────────────────────────────────────────────────────────
@@ -310,23 +395,88 @@ with st.sidebar:
         "Sheets are matched by name (case-insensitive substring), "
         "so column order or extra tabs won't break parsing."
     )
+    st.caption(
+        "Rows with a red-highlighted Date cell are automatically "
+        "discarded before analysis."
+    )
 
 # ──────────────────────────────────────────────────────────────
-# Main area — file upload + run
+# Main area — file upload → filter → run
 # ──────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader(
-    "Upload your GoDaddy IC Data workbook (.xlsx)", type=["xlsx", "xls"]
+    "Upload the GoDaddy IC Data workbook (.xlsx)", type=["xlsx", "xls"]
 )
 
 if uploaded_file:
-    datasets = load_and_process(uploaded_file.read())
+    datasets_raw, red_counts = load_and_process(uploaded_file.read())
 
-    # Quick stats
+    # ── Red-row discard summary ──
+    total_red = sum(red_counts.values())
+    if total_red > 0:
+        sheets_hit = {k: v for k, v in red_counts.items() if v > 0}
+        detail = ", ".join(
+            f"{k.replace('_', ' ').title()} ({v:,})" for k, v in sheets_hit.items()
+        )
+        st.success(
+            f"🟥 **Auto-discarded {total_red:,} red-highlighted rows** across "
+            f"{len(sheets_hit)} sheet(s): {detail}"
+        )
+
+    # ── Detect date bounds from all_coverage ──
+    all_dates = datasets_raw["all_coverage"]["Date"].dropna()
+    if all_dates.empty:
+        st.error("No valid dates found in the uploaded workbook.")
+        st.stop()
+
+    data_min = all_dates.min().date()
+    data_max = all_dates.max().date()
+
+    # ── Date range filter ──
+    st.subheader("📅 Date Range Filter")
+    filter_cols = st.columns([1, 1, 2])
+    with filter_cols[0]:
+        start_date = st.date_input(
+            "Start date",
+            value=data_min,
+            min_value=data_min,
+            max_value=data_max,
+            key="start_date",
+        )
+    with filter_cols[1]:
+        end_date = st.date_input(
+            "End date",
+            value=data_max,
+            min_value=data_min,
+            max_value=data_max,
+            key="end_date",
+        )
+    with filter_cols[2]:
+        st.caption(
+            f"Data spans **{data_min.strftime('%b %d, %Y')}** to "
+            f"**{data_max.strftime('%b %d, %Y')}**. Narrow the window "
+            "to focus insights on a specific period."
+        )
+
+    if start_date > end_date:
+        st.error("Start date must be on or before end date.")
+        st.stop()
+
+    # Apply filter
+    datasets = apply_date_filter(datasets_raw, start_date, end_date)
+
+    # ── Dataset overview (filtered) ──
     st.subheader("📋 Dataset Overview")
+    date_range_active = start_date != data_min or end_date != data_max
+    if date_range_active:
+        st.caption(
+            f"Showing rows from **{start_date.strftime('%b %d, %Y')}** to "
+            f"**{end_date.strftime('%b %d, %Y')}**"
+        )
+
     display_units = [(k, l) for k, l, _ in BUSINESS_UNITS]
     stat_cols = st.columns(len(display_units))
     for col, (key, label) in zip(stat_cols, display_units):
-        n = len(datasets.get(key, []))
+        n = len(datasets.get(key, pd.DataFrame()))
         col.metric(label.split(" ", 1)[1], f"{n:,} rows")
 
     st.divider()

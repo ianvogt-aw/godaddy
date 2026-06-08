@@ -26,9 +26,10 @@ If deploying on Streamlit Community Cloud, add these same four keys in the app's
 
 ## How to Use
 
-1. **Prepare your data** — save a copy of the GoDaddy IC Data grid with only coverage data from the month of interest (delete scrubbed rows + old coverage, use sorting to make this easy).
-2. **Upload the workbook** — sheets are matched by name (case-insensitive substring), so exact ordering and extra tabs won't break parsing.
-3. **Click "Generate Insights"** and wait for all summaries to complete.
+1. **Upload the workbook** — no manual prep needed. Sheets are matched by name (case-insensitive substring), so exact ordering and extra tabs won't break parsing.
+2. **Red-highlighted rows are auto-discarded** — any row whose Date cell has a red fill (`#FF0000`) is dropped before analysis, eliminating the need to manually delete scrubbed/old coverage.
+3. **Filter to a date range** (optional) — after upload, use the date pickers to narrow coverage to a specific month or period. Stats update live.
+4. **Click "Generate Insights"** and wait for all summaries to complete.
 
 ## What It Produces
 
