@@ -42,6 +42,9 @@ SHEET_NAMES = [
     "kasturu_mudulodu",
     "mark_mccaffrey",
     "jared_sine",
+    "travis_muhlestein",
+    "demetria",
+    "berea_schaffer",
     "general",
 ]
 
@@ -98,7 +101,7 @@ def load_and_process(file_bytes):
     brand = cols(dataframes["brand"])
 
     executive = pd.concat(
-        [cols(dataframes[n]) for n in ("aman_bhutani", "gourav_pani", "kasturu_mudulodu", "mark_mccaffrey", "jared_sine")],
+        [cols(dataframes[n]) for n in ("aman_bhutani", "gourav_pani", "kasturu_mudulodu", "mark_mccaffrey", "jared_sine", "travis_muhlestein", "demetria", "berea_schaffer")],
         ignore_index=True,
     )
 
