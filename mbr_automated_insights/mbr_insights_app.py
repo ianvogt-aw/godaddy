@@ -382,6 +382,63 @@ connecting the dots between them."""
     return call_claude(client, prompt, max_tokens=500)
 
 
+def enrich_insights_with_examples(
+    client, insights_text: str, all_coverage_df: pd.DataFrame
+) -> str:
+    """Match each overall insight to 3-5 specific coverage articles."""
+    # Build a compact, deduplicated article list (Date + Title)
+    articles = (
+        all_coverage_df[["Date", "Title"]]
+        .dropna(subset=["Title"])
+        .drop_duplicates(subset="Title")
+        .sort_values("Date")
+    )
+
+    # Safety cap — if the dataset is very large, sample to keep the
+    # prompt within comfortable context-window limits.
+    MAX_ARTICLES = 3000
+    if len(articles) > MAX_ARTICLES:
+        articles = articles.sample(MAX_ARTICLES, random_state=42).sort_values("Date")
+
+    coverage_list = "\n".join(
+        f"[{row.Date.strftime('%Y-%m-%d')}] {row.Title}"
+        for row in articles.itertuples()
+        if pd.notna(row.Date)
+    )
+
+    prompt = f"""Below are strategic insights about GoDaddy's media coverage, followed by
+a list of all coverage articles (date + title) from the analysis period.
+
+INSIGHTS:
+{insights_text}
+
+COVERAGE ARTICLES:
+{coverage_list}
+
+For EACH insight above, select 3 to 5 specific articles from the COVERAGE
+ARTICLES list that best support or illustrate that insight.
+
+Format your response by repeating each insight as a bullet point (*),
+followed by the supporting articles as indented sub-bullets (  —), each
+with the date and exact title from the list.
+
+Example format:
+* [Insight text here]
+  — [2026-01-15] Article Title Here
+  — [2026-02-03] Another Article Title
+  — [2026-03-20] Third Supporting Article
+
+RULES:
+- Use the EXACT titles from the COVERAGE ARTICLES list. Do not paraphrase
+  or invent titles.
+- Choose articles that genuinely demonstrate the insight, not just ones
+  that share a keyword.
+- Prefer articles spread across different dates when possible to show the
+  trend or pattern described in the insight."""
+
+    return call_claude(client, prompt, max_tokens=1500)
+
+
 # ──────────────────────────────────────────────────────────────
 # Sidebar
 # ──────────────────────────────────────────────────────────────
@@ -495,7 +552,7 @@ if uploaded_file:
             st.stop()
 
         summaries: dict[str, str] = {}
-        total_steps = len(BUSINESS_UNITS) + 2  # +1 exec summary, +1 overall
+        total_steps = len(BUSINESS_UNITS) + 3  # +1 exec, +1 insights, +1 enrichment
 
         # ── Business-unit summaries ──
         st.subheader("📊 Coverage Area Summaries")
@@ -536,9 +593,18 @@ if uploaded_file:
             (len(BUSINESS_UNITS) + 1) / total_steps,
             text="Generating overall insights …",
         )
+        insights_raw = generate_overall_insights(bedrock_runtime, summaries)
+
+        # ── Enrich insights with supporting coverage examples ──
+        progress.progress(
+            (len(BUSINESS_UNITS) + 2) / total_steps,
+            text="Matching insights to coverage examples …",
+        )
         st.subheader("💡 Overall Insights")
-        insights = generate_overall_insights(bedrock_runtime, summaries)
-        st.markdown(insights)
+        insights_enriched = enrich_insights_with_examples(
+            bedrock_runtime, insights_raw, datasets["all_coverage"]
+        )
+        st.markdown(insights_enriched)
 
         progress.progress(1.0, text="✅ Analysis complete!")
 
