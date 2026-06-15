@@ -49,6 +49,26 @@ BEDROCK_MODEL_ID = st.secrets.get(
 
 EXCLUDED_TABS = {"Legend", "Hist_Data", "Hist_Calc", "Hist_Stage"}
 
+PRESS_RELEASE_DOMAINS = {
+    "prnewswire.com",
+    "businesswire.com",
+    "globenewswire.com",
+    "prweb.com",
+    "newswire.com",
+    "einpresswire.com",
+    "accesswire.com",
+    "prlog.org",
+    "send2press.com",
+    "24-7pressrelease.com",
+    "newswire.ca",
+    "marketwired.com",
+    "marketwire.com",
+    "presswire.com",
+    "prfire.co.uk",
+    "cisionone.com",
+    "cision.com",
+}
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
@@ -653,7 +673,17 @@ E - Error: The evidence could not be read (blank, error, inaccessible).
 F - Unclear: The evidence is readable but too thin, mixed, incomplete, or contradictory \
 to classify confidently.
 
+G - Press Release: The source article is a press release or wire-service distribution. \
+Key signals: content begins with or contains "FOR IMMEDIATE RELEASE"; a press-release \
+dateline format (e.g. "CITY, State, Month Day, Year —"); boilerplate sections like \
+"About [Company]", "Media Contact:", or a "###" end marker; highly promotional \
+third-person copy announcing a product launch, partnership, or executive quote in a \
+way typical of corporate press releases. Classify as G regardless of whether GoDaddy \
+is also a product/brand/research mention — press releases are discarded entirely.
+
 Strict decision rules:
+- Check for press release signals FIRST. If the source is clearly a press release, \
+classify as G regardless of A/B/C signals.
 - If both A and B signals appear, choose A.
 - If both B and C signals appear and the mention is about research/survey/report/index/data, choose C.
 - Do NOT use A just because the article topic is domains, hosting, or websites. \
@@ -675,6 +705,7 @@ Justification rules:
 - Good: "Evidence says the domain was registered through GoDaddy."
 - Good: "Evidence cites GoDaddy Small Business Research Lab data on microbusiness trends."
 - Good: "Evidence lists GoDaddy stock as an S&P 500 mover but no product is discussed."
+- Good: "Content contains 'FOR IMMEDIATE RELEASE' and a press-release dateline, indicating a wire-service distribution."
 - Bad: "GoDaddy is mentioned." (too vague)
 
 Confidence scoring:
@@ -686,11 +717,21 @@ Confidence scoring:
 """
 
 
-def classify_mention(evidence: str, llm_config: dict) -> dict:
+def classify_mention(evidence: str, llm_config: dict, url: str = "") -> dict:
     """
     Send evidence text to the configured LLM and return classification dict.
     Returns {"classification": "X", "justification": "...", "confidence": N}.
     """
+    # Pre-check: known press release wire service domains → auto-classify as G
+    if url:
+        netloc = urlparse(url).netloc.lower().lstrip("www.")
+        if any(netloc == d or netloc.endswith("." + d) for d in PRESS_RELEASE_DOMAINS):
+            return {
+                "classification": "G",
+                "justification": f"Article URL is from a known press wire service ({netloc}).",
+                "confidence": 98,
+            }
+
     default_error = {
         "classification": "E",
         "justification": "LLM classification call failed.",
@@ -708,7 +749,7 @@ def classify_mention(evidence: str, llm_config: dict) -> dict:
         raw = re.sub(r"\s*```$", "", raw)
         result = json.loads(raw)
         # Validate
-        if result.get("classification") not in ("A", "B", "C", "D", "E", "F"):
+        if result.get("classification") not in ("A", "B", "C", "D", "E", "F", "G"):
             result["classification"] = "F"
         result["confidence"] = int(result.get("confidence", 50))
         return result
@@ -1654,7 +1695,7 @@ if st.session_state.get("ext_running"):
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("# Classify Mentions")
 st.markdown(
-    '<p class="subtitle">Classify each extracted mention into A (Product) · B (Brand) · C (Research) · D (None) · E (Error) · F (Unclear)</p>',
+    '<p class="subtitle">Classify each extracted mention into A (Product) · B (Brand) · C (Research) · D (None) · E (Error) · F (Unclear) · G (Press Release)</p>',
     unsafe_allow_html=True,
 )
 
@@ -1899,7 +1940,7 @@ if st.session_state.get("cl_running"):
             row[CONF_COL] = "90"
             cl_err += 1
         else:
-            result = classify_mention(evidence, cl_llm_config)
+            result = classify_mention(evidence, cl_llm_config, url=url)
             row[CLASS_COL] = result["classification"]
             row[JUST_COL] = result["justification"]
             row[CONF_COL] = str(result["confidence"])
