@@ -681,9 +681,20 @@ third-person copy announcing a product launch, partnership, or executive quote i
 way typical of corporate press releases. Classify as G regardless of whether GoDaddy \
 is also a product/brand/research mention — press releases are discarded entirely.
 
+H - Commercial/Advertisement: The mention is about or directly references a GoDaddy \
+TV commercial, advertisement, ad campaign, or promotional spot. Key signals: article \
+reviews, recaps, or discusses a GoDaddy ad or commercial (e.g. Super Bowl spot, \
+streaming ad); evidence references GoDaddy advertising talent or a spokesperson in \
+an advertising context (e.g. "Walton Goggins", "Goggle Glasses", a celebrity \
+appearing in a GoDaddy ad); coverage of a GoDaddy ad campaign, ad creative, or \
+marketing stunt rather than the company or its products. Classify as H regardless \
+of other signals — commercial mentions are discarded.
+
 Strict decision rules:
 - Check for press release signals FIRST. If the source is clearly a press release, \
 classify as G regardless of A/B/C signals.
+- Check for commercial/ad signals SECOND. If the mention is about a GoDaddy commercial \
+or ad campaign, classify as H regardless of A/B/C signals.
 - If both A and B signals appear, choose A.
 - If both B and C signals appear and the mention is about research/survey/report/index/data, choose C.
 - Do NOT use A just because the article topic is domains, hosting, or websites. \
@@ -749,7 +760,7 @@ def classify_mention(evidence: str, llm_config: dict, url: str = "") -> dict:
         raw = re.sub(r"\s*```$", "", raw)
         result = json.loads(raw)
         # Validate
-        if result.get("classification") not in ("A", "B", "C", "D", "E", "F", "G"):
+        if result.get("classification") not in ("A", "B", "C", "D", "E", "F", "G", "H"):
             result["classification"] = "F"
         result["confidence"] = int(result.get("confidence", 50))
         return result
@@ -1695,7 +1706,7 @@ if st.session_state.get("ext_running"):
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("# Classify Mentions")
 st.markdown(
-    '<p class="subtitle">Classify each extracted mention into A (Product) · B (Brand) · C (Research) · D (None) · E (Error) · F (Unclear) · G (Press Release)</p>',
+    '<p class="subtitle">Classify each extracted mention into A (Product) · B (Brand) · C (Research) · D (None) · E (Error) · F (Unclear) · G (Press Release) · H (Commercial)</p>',
     unsafe_allow_html=True,
 )
 
