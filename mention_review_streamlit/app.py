@@ -651,7 +651,8 @@ Classify into exactly ONE category:
 
 A - GoDaddy Products: The evidence explicitly mentions a specific GoDaddy product, service, \
 platform, tool, plan, feature, pricing tier, or product use case. \
-Examples: "registered through GoDaddy", "hosted on GoDaddy", "GoDaddy Economy", \
+Examples: "ANS", "Agent Name Service", "Airo", \
+"registered through GoDaddy", "hosted on GoDaddy", "GoDaddy Economy", \
 "GoDaddy Website Builder", "GoDaddy-issued certificate", domain sold at auction by GoDaddy, \
 GoDaddy as registrar, host, DNS, WHOIS, SSL, email, payments, or security provider, \
 "GoDaddy website team", "GoDaddy Secret Manager".
@@ -682,13 +683,13 @@ way typical of corporate press releases. Classify as G regardless of whether GoD
 is also a product/brand/research mention — press releases are discarded entirely.
 
 H - Commercial/Advertisement: The mention is about or directly references a GoDaddy \
-TV commercial, advertisement, ad campaign, or promotional spot. Key signals: article \
-reviews, recaps, or discusses a GoDaddy ad or commercial (e.g. Super Bowl spot, \
-streaming ad); evidence references GoDaddy advertising talent or a spokesperson in \
-an advertising context (e.g. "Walton Goggins", "Goggle Glasses", a celebrity \
-appearing in a GoDaddy ad); coverage of a GoDaddy ad campaign, ad creative, or \
-marketing stunt rather than the company or its products. Classify as H regardless \
-of other signals — commercial mentions are discarded.
+TV commercial, advertisement, ad campaign, promotional spot, or paid/sponsored content. \
+Key signals: article reviews, recaps, or discusses a GoDaddy ad or commercial \
+(e.g. Super Bowl spot, streaming ad); evidence references GoDaddy advertising  \
+talent or a spokesperson in an advertising context (e.g. "Walton Goggins", \
+"Goggle Glasses", a celebrity appearing in a GoDaddy ad); coverage of a GoDaddy \
+ad campaign, ad creative, or marketing stunt rather than the company or its products. \
+Classify as H regardless of other signals — commercial mentions are discarded.
 
 Strict decision rules:
 - Check for press release signals FIRST. If the source is clearly a press release, \
