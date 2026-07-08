@@ -384,6 +384,22 @@ THIN_BORDER = Border(
     bottom=Side(style="thin", color="D0D0D0"),
 )
 
+# Data-label row fills, matching the Legend tab: Orange = new T1 data to review,
+# Pink = new Non-T1 data to review. Red ("Removed") is a manual designation this
+# script never applies and never clears. NO_FILL is used to "age out" a row from
+# Orange/Pink to White once it's no longer new.
+ORANGE_FILL_ARGB = "FFFBE2D5"
+PINK_FILL_ARGB = "FFF2CEEF"
+RED_FILL_ARGB = "FFFF0000"
+ORANGE_FILL = PatternFill("solid", fgColor=ORANGE_FILL_ARGB)
+PINK_FILL = PatternFill("solid", fgColor=PINK_FILL_ARGB)
+NO_FILL = PatternFill(fill_type=None)
+
+
+def _row_tier_fill(row_data: list) -> PatternFill:
+    """Custom Categories (last column) is "Y" only for T1 rows (see mention_to_row)."""
+    return ORANGE_FILL if row_data[-1] == "Y" else PINK_FILL
+
 
 def write_tab(ws, rows: list[list]):
     """Write header + data rows to a worksheet with formatting."""
@@ -398,10 +414,12 @@ def write_tab(ws, rows: list[list]):
     rows_sorted = sorted(rows, key=lambda r: (r[0] or datetime.min.date(), r[1] or datetime.min.time()), reverse=True)
 
     for row_idx, row_data in enumerate(rows_sorted, start=2):
+        fill = _row_tier_fill(row_data)
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = CELL_FONT
             cell.border = THIN_BORDER
+            cell.fill = fill
 
     # Column widths
     for col_letter, width in COL_WIDTHS.items():
@@ -481,12 +499,39 @@ def create_workbook(tab_data: dict[str, list[list]], output_path: str):
     print(f"\n✅ Saved to {output_path}")
 
 
+def downgrade_reviewed_rows(wb):
+    """Age out last run's "new data" highlighting: any row still filled Orange or Pink
+    (Keep - T1 / Keep - Non-T1) is cleared to White now that it's no longer new. Rows
+    filled Red (Removed) are a manual designation and are left untouched. Only scans
+    tabs this script manages (not foreign/manual sheets in the workbook)."""
+    downgraded = 0
+    for tab_name in TAB_ORDER:
+        ws_name = tab_name[:31]
+        if ws_name not in wb.sheetnames:
+            continue
+        ws = wb[ws_name]
+        if ws.max_row < 2:
+            continue
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=ws.max_column):
+            marker_fill = row[0].fill
+            fg = marker_fill.fgColor
+            if marker_fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb in (ORANGE_FILL_ARGB, PINK_FILL_ARGB):
+                for cell in row:
+                    cell.fill = NO_FILL
+                downgraded += 1
+    if downgraded:
+        print(f"  🎨 Downgraded {downgraded} previously-new row(s) from Orange/Pink to White")
+    return downgraded
+
+
 def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, output_path: str):
     """Append new mentions to an existing IC Data workbook, deduplicating by Document ID."""
     wb = openpyxl.load_workbook(existing_path)
 
     if "Legend" not in wb.sheetnames:
         build_legend_sheet(wb)
+
+    downgrade_reviewed_rows(wb)
 
     for tab_name, new_rows in tab_data.items():
         if not new_rows:
@@ -506,9 +551,16 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
             # Filter out duplicates
             new_unique = [r for r in new_rows if r[2] not in existing_ids]
 
-            # Append new rows at the bottom
-            for row_data in new_unique:
-                ws.append(row_data)
+            # Append new rows at the bottom, tagged Orange/Pink as new data to review
+            start_row = ws.max_row + 1
+            for offset, row_data in enumerate(new_unique):
+                row_idx = start_row + offset
+                fill = _row_tier_fill(row_data)
+                for col_idx, value in enumerate(row_data, start=1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                    cell.font = CELL_FONT
+                    cell.border = THIN_BORDER
+                    cell.fill = fill
 
             print(f"  📄 {tab_name}: +{len(new_unique)} new ({len(new_rows) - len(new_unique)} dupes skipped)")
         else:
