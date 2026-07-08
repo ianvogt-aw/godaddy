@@ -28,6 +28,7 @@ from collections import defaultdict
 
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.styles.colors import Color
 from openpyxl.utils import get_column_letter
 from dateutil import parser as dtparser
 
@@ -51,7 +52,7 @@ STREAMS = [
     # ── CORPORATE T1 ──────────────────────────────────────────────────
     {"id": 941782, "label": "Brand",               "tier": "T1",  "group": "CORPORATE", "tab": "Brand + Int.",               "input_name": "GoDaddy Brand - T1"},
     {"id": 941789, "label": "Finance",             "tier": "T1",  "group": "CORPORATE", "tab": "Finance + Int.",             "input_name": "GoDaddy - Finance - T1"},
-    {"id": 941792, "label": "Thought Leadership",  "tier": "T1",  "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - T1"},
+    {"id": 941792, "label": "Thought Leadership",  "tier": "T1",  "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - T1", "split_by_person": True},
     # ── SBRL T1 ───────────────────────────────────────────────────────
     {"id": 941796, "label": "sbrl", "tier": "T1",     "group": "SBRL", "tab": "GDSBRL + Int.", "input_name": "GoDaddy Venture Forward - T1"},
     # ── PRODUCTS (Non-T1) ─────────────────────────────────────────────
@@ -63,10 +64,30 @@ STREAMS = [
     # ── CORPORATE (Non-T1) ────────────────────────────────────────────
     {"id": 943639, "label": "Brand",               "tier": "Non-T1", "group": "CORPORATE", "tab": "Brand + Int.",               "input_name": "GoDaddy Brand - Non T1"},
     {"id": 943641, "label": "Finance",             "tier": "Non-T1", "group": "CORPORATE", "tab": "Finance + Int.",             "input_name": "GoDaddy - Finance - Non T1"},
-    {"id": 943642, "label": "Thought Leadership",  "tier": "Non-T1", "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - Non T1"},
+    {"id": 943642, "label": "Thought Leadership",  "tier": "Non-T1", "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - Non T1", "split_by_person": True},
     # ── SBRL (Non-T1) ────────────────────────────────────────────────
     {"id": 943644, "label": "sblr", "tier": "Non-T1", "group": "SBRL", "tab": "GDSBRL + Int.", "input_name": "GoDaddy Venture Forward - Non T1"},
 ]
+
+# Thought Leadership mentions are split out of the combined stream into one tab per
+# spokesperson, based on which person's name appears in the mention's Keywords field.
+# A mention tagged to multiple people (e.g. "Travis Muhlestein;Jared Sine") lands in
+# both tabs.
+PEOPLE = [
+    "Aman Bhutani",
+    "Gourav Pani",
+    "Mark McCaffrey",
+    "Kasturi Mudulodu",
+    "Jared Sine",
+    "Sarfraz Nakai",
+    "Charles Beadnall",
+    "Travis Muhlestein",
+    "Dimitria Elmore",
+    "Paul Bindel",
+    "Phontip Palitwanon",
+]
+PEOPLE_TABS = {name: f"{name} + Int." for name in PEOPLE}
+PEOPLE_LOOKUP = {name.lower(): tab for name, tab in PEOPLE_TABS.items()}
 
 # Desired tab ordering in the output workbook
 TAB_ORDER = [
@@ -78,8 +99,7 @@ TAB_ORDER = [
     "Other (Product) + Int.",
     "Brand + Int.",
     "Finance + Int.",
-    "Thought Leadership + Int.",
-]
+] + list(PEOPLE_TABS.values())
 
 # The 42 columns matching the existing IC Data grid
 IC_COLUMNS = [
@@ -302,17 +322,21 @@ def mention_to_row(mention: dict, stream_config: dict) -> list:
 
     content_text = mention.get("excerpt") or mention.get("transcript") or ""
 
+    # Fall back to Cision's internal link when the mention has no public URL
+    # (common for broadcast clips and some social posts).
+    url = mention.get("url") or mention.get("internalLink") or ""
+
     return [
         dt.date() if dt else None,                         # Date
         dt.time() if dt else None,                         # Time
         mention.get("id"),                                  # Document ID
-        mention.get("url", ""),                             # URL
+        url,                                                 # URL
         stream_config["input_name"],                        # Input Name
         keywords_str,                                       # Keywords
         map_info_type(medium),                              # Information Type
         map_medium_to_source_type(medium, mtype),           # Source Type
         mention.get("source", ""),                          # Source Name
-        extract_domain(mention.get("url", "")),             # Source Domain
+        extract_domain(url),                                # Source Domain
         map_type_to_content_type(mtype),                    # Content Type
         mention.get("author", ""),                          # Author Name
         None,                                               # Author Handle (not in API)
@@ -344,7 +368,7 @@ def mention_to_row(mention: dict, stream_config: dict) -> list:
         None,                                               # Views
         None,                                               # Estimated Views
         None,                                               # Document Tags (not in API)
-        None,                                               # Custom Categories (not in API)
+        "Y" if stream_config["tier"] == "T1" else None,     # Custom Categories: Y for T1 streams
     ]
 
 
@@ -392,15 +416,64 @@ def write_tab(ws, rows: list[list]):
         ws.auto_filter.ref = f"A1:{last_col}{len(rows) + 1}"
 
 
+# Tab color used for the Thought Leadership person tabs, matching the "Corporate"
+# swatch on the Legend tab.
+CORPORATE_TAB_COLOR = Color(theme=9, tint=0.7999816888943144, type="theme")
+
+
+def build_legend_sheet(wb, index: int = 0):
+    """Create the Legend tab explaining the workbook's color-coding conventions."""
+    ws = wb.create_sheet(title="Legend", index=index)
+    ws.column_dimensions["B"].width = 21.1
+    ws.column_dimensions["C"].width = 22.1
+
+    ws["B2"] = "Data Labels"
+
+    ws["B3"] = "Red"
+    ws["B3"].fill = PatternFill("solid", fgColor="FFFF0000")
+    ws["C3"] = "Removed"
+
+    ws["B4"] = "Orange"
+    ws["B4"].fill = PatternFill("solid", fgColor="FFFBE2D5")
+    ws["C4"] = "Keep - T1"
+
+    ws["B5"] = "Pink"
+    ws["B5"].fill = PatternFill("solid", fgColor="FFF2CEEF")
+    ws["C5"] = "Keep - Non-T1"
+
+    ws["B7"] = "Tabs"
+
+    ws["B8"] = "Pink"
+    ws["B8"].fill = PatternFill("solid", fgColor="FFF2CFEF")
+    ws["C8"] = "SBRL"
+
+    ws["B9"] = "Blue"
+    ws["B9"].fill = PatternFill("solid", fgColor="FFC0E5F4")
+    ws["C9"] = "Product"
+
+    ws["B10"] = "Green"
+    ws["B10"].fill = PatternFill(fill_type="solid", fgColor=CORPORATE_TAB_COLOR)
+    ws["C10"] = "Corporate"
+
+    ws["B11"] = "White"
+    ws["C11"] = "Source of Truth/General"
+
+    return ws
+
+
 def create_workbook(tab_data: dict[str, list[list]], output_path: str):
     """Create a new IC Data workbook with all tabs."""
     wb = openpyxl.Workbook()
     # Remove default sheet
     wb.remove(wb.active)
 
+    build_legend_sheet(wb)
+
     for tab_name in TAB_ORDER:
         rows = tab_data.get(tab_name, [])
         ws = wb.create_sheet(title=tab_name[:31])  # Excel 31-char tab name limit
+        if tab_name in PEOPLE_TABS.values():
+            ws.sheet_properties.tabColor = CORPORATE_TAB_COLOR
         write_tab(ws, rows)
         print(f"  📄 {tab_name}: {len(rows)} mentions")
 
@@ -411,6 +484,9 @@ def create_workbook(tab_data: dict[str, list[list]], output_path: str):
 def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, output_path: str):
     """Append new mentions to an existing IC Data workbook, deduplicating by Document ID."""
     wb = openpyxl.load_workbook(existing_path)
+
+    if "Legend" not in wb.sheetnames:
+        build_legend_sheet(wb)
 
     for tab_name, new_rows in tab_data.items():
         if not new_rows:
@@ -437,6 +513,8 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
             print(f"  📄 {tab_name}: +{len(new_unique)} new ({len(new_rows) - len(new_unique)} dupes skipped)")
         else:
             ws = wb.create_sheet(title=ws_name)
+            if tab_name in PEOPLE_TABS.values():
+                ws.sheet_properties.tabColor = CORPORATE_TAB_COLOR
             write_tab(ws, new_rows)
             print(f"  📄 {tab_name}: {len(new_rows)} mentions (new tab)")
 
@@ -452,6 +530,7 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str) -> dict[
     """Fetch mentions from all 18 streams and organize by tab."""
     tab_data: dict[str, list[list]] = defaultdict(list)
     total_mentions = 0
+    unmatched_person_mentions = 0
 
     for i, stream in enumerate(STREAMS, start=1):
         sid = stream["id"]
@@ -467,10 +546,31 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str) -> dict[
             print(f"    ❌ Error: {e}")
             continue
 
-        rows = [mention_to_row(m, stream) for m in mentions]
-        tab_data[tab].extend(rows)
+        if stream.get("split_by_person"):
+            matched = 0
+            for m in mentions:
+                person_tabs = {
+                    PEOPLE_LOOKUP[kw.lower()]
+                    for kw in (m.get("keywords") or [])
+                    if kw.lower() in PEOPLE_LOOKUP
+                }
+                if not person_tabs:
+                    unmatched_person_mentions += 1
+                    continue
+                row = mention_to_row(m, stream)
+                for person_tab in person_tabs:
+                    tab_data[person_tab].append(row)
+                matched += 1
+            print(f"    ✓ {len(mentions)} mentions → routed {matched} to person tabs")
+        else:
+            rows = [mention_to_row(m, stream) for m in mentions]
+            tab_data[tab].extend(rows)
+            print(f"    ✓ {len(mentions)} mentions")
+
         total_mentions += len(mentions)
-        print(f"    ✓ {len(mentions)} mentions")
+
+    if unmatched_person_mentions:
+        print(f"\n⚠️  {unmatched_person_mentions} Thought Leadership mention(s) didn't match any known person and were skipped")
 
     # Deduplicate within each tab (same article can appear in T1 and Non-T1 with different Input Names)
     # We keep both since they have different Input Names — that's intentional per the grid design
