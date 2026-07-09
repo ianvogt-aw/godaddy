@@ -18,10 +18,12 @@ Requirements:
 
 import argparse
 import os
+import re
 import sys
 import time
 import json
 import requests
+from copy import copy
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -53,6 +55,7 @@ STREAMS = [
     {"id": 941782, "label": "Brand",               "tier": "T1",  "group": "CORPORATE", "tab": "Brand + Int.",               "input_name": "GoDaddy Brand - T1"},
     {"id": 941789, "label": "Finance",             "tier": "T1",  "group": "CORPORATE", "tab": "Finance + Int.",             "input_name": "GoDaddy - Finance - T1"},
     {"id": 941792, "label": "Thought Leadership",  "tier": "T1",  "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - T1", "split_by_person": True},
+    {"id": 964987, "label": "ANS Open Standard",   "tier": "T1",  "group": "ANS_OPEN_STANDARD", "tab": "ANS Open Standard", "input_name": "ANS Open Standard - T1"},
     # ── SBRL T1 ───────────────────────────────────────────────────────
     {"id": 941796, "label": "sbrl", "tier": "T1",     "group": "SBRL", "tab": "GDSBRL + Int.", "input_name": "GoDaddy Venture Forward - T1"},
     # ── PRODUCTS (Non-T1) ─────────────────────────────────────────────
@@ -65,6 +68,7 @@ STREAMS = [
     {"id": 943639, "label": "Brand",               "tier": "Non-T1", "group": "CORPORATE", "tab": "Brand + Int.",               "input_name": "GoDaddy Brand - Non T1"},
     {"id": 943641, "label": "Finance",             "tier": "Non-T1", "group": "CORPORATE", "tab": "Finance + Int.",             "input_name": "GoDaddy - Finance - Non T1"},
     {"id": 943642, "label": "Thought Leadership",  "tier": "Non-T1", "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - Non T1", "split_by_person": True},
+    {"id": 964967, "label": "ANS Open Standard",   "tier": "Non-T1", "group": "ANS_OPEN_STANDARD", "tab": "ANS Open Standard", "input_name": "ANS Open Standard - Non T1"},
     # ── SBRL (Non-T1) ────────────────────────────────────────────────
     {"id": 943644, "label": "sblr", "tier": "Non-T1", "group": "SBRL", "tab": "GDSBRL + Int.", "input_name": "GoDaddy Venture Forward - Non T1"},
 ]
@@ -97,6 +101,7 @@ TAB_ORDER = [
     "Airo (Product) + Int.",
     "ANS (Product) + Int.",
     "Other (Product) + Int.",
+    "ANS Open Standard",
     "Brand + Int.",
     "Finance + Int.",
 ] + list(PEOPLE_TABS.values())
@@ -113,6 +118,7 @@ IC_COLUMNS = [
     "Comments", "Reactions", "Views", "Estimated Views",
     "Document Tags", "Custom Categories",
 ]
+HIT_SENTENCE_COL_IDX = IC_COLUMNS.index("Hit Sentence")  # 0-based
 
 # Column widths for readability
 COL_WIDTHS = {
@@ -299,6 +305,33 @@ def map_language_code(code: str) -> str:
     return lang_map.get(code, lang_map.get(code.split("-")[0], code))
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def focus_hit_sentence(text: str, keyword: str = "GoDaddy") -> tuple[str, bool]:
+    """Prefer the sentence mentioning `keyword` over Cision's raw excerpt/transcript
+    blob. The API only gives us one fixed excerpt with no keyword offsets or full
+    article body, so this can only re-center within text Cision already returned —
+    if `keyword` isn't present anywhere in it, the text is returned unchanged.
+    Returns (text, found) so callers can flag mentions where `keyword` never
+    turned up at all."""
+    if not text:
+        return text, False
+    found = keyword.lower() in text.lower()
+    if not found:
+        return text, False
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        if keyword.lower() in sentence.lower():
+            return sentence.strip(), True
+    return text, True
+
+
+class Row(list):
+    """A data row that also remembers whether its Hit Sentence should be flagged
+    Yellow (the focus keyword never turned up in Cision's excerpt/transcript)."""
+    hit_sentence_flagged = False
+
+
 def mention_to_row(mention: dict, stream_config: dict) -> list:
     """Convert a single API mention + stream metadata → 42-element list matching IC_COLUMNS."""
     pub = mention.get("publishedAt", "")
@@ -321,12 +354,16 @@ def mention_to_row(mention: dict, stream_config: dict) -> list:
     keywords_str = ";".join(keywords_raw) if keywords_raw else ""
 
     content_text = mention.get("excerpt") or mention.get("transcript") or ""
+    hit_sentence_flagged = False
+    if stream_config["tab"] != "ANS Open Standard":
+        content_text, keyword_found = focus_hit_sentence(content_text, "GoDaddy")
+        hit_sentence_flagged = not keyword_found
 
     # Fall back to Cision's internal link when the mention has no public URL
     # (common for broadcast clips and some social posts).
     url = mention.get("url") or mention.get("internalLink") or ""
 
-    return [
+    row = Row([
         dt.date() if dt else None,                         # Date
         dt.time() if dt else None,                         # Time
         mention.get("id"),                                  # Document ID
@@ -369,7 +406,9 @@ def mention_to_row(mention: dict, stream_config: dict) -> list:
         None,                                               # Estimated Views
         None,                                               # Document Tags (not in API)
         "Y" if stream_config["tier"] == "T1" else None,     # Custom Categories: Y for T1 streams
-    ]
+    ])
+    row.hit_sentence_flagged = hit_sentence_flagged
+    return row
 
 
 # ============================================================================
@@ -391,14 +430,26 @@ THIN_BORDER = Border(
 ORANGE_FILL_ARGB = "FFFBE2D5"
 PINK_FILL_ARGB = "FFF2CEEF"
 RED_FILL_ARGB = "FFFF0000"
+YELLOW_FILL_ARGB = "FFFFFF00"
 ORANGE_FILL = PatternFill("solid", fgColor=ORANGE_FILL_ARGB)
 PINK_FILL = PatternFill("solid", fgColor=PINK_FILL_ARGB)
+# Standard Yellow — flags a Hit Sentence where the focus keyword ("GoDaddy") never
+# turned up in Cision's excerpt/transcript at all (see focus_hit_sentence).
+YELLOW_FILL = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
 NO_FILL = PatternFill(fill_type=None)
 
 
 def _row_tier_fill(row_data: list) -> PatternFill:
     """Custom Categories (last column) is "Y" only for T1 rows (see mention_to_row)."""
     return ORANGE_FILL if row_data[-1] == "Y" else PINK_FILL
+
+
+def _cell_fill(row_data: list, col_idx: int, row_fill: PatternFill) -> PatternFill:
+    """The Hit Sentence cell gets Yellow instead of the row's Orange/Pink/etc. fill
+    when its Row was flagged by focus_hit_sentence (see Row/mention_to_row)."""
+    if col_idx - 1 == HIT_SENTENCE_COL_IDX and getattr(row_data, "hit_sentence_flagged", False):
+        return YELLOW_FILL
+    return row_fill
 
 
 def write_tab(ws, rows: list[list]):
@@ -419,7 +470,7 @@ def write_tab(ws, rows: list[list]):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = CELL_FONT
             cell.border = THIN_BORDER
-            cell.fill = fill
+            cell.fill = _cell_fill(row_data, col_idx, fill)
 
     # Column widths
     for col_letter, width in COL_WIDTHS.items():
@@ -434,9 +485,26 @@ def write_tab(ws, rows: list[list]):
         ws.auto_filter.ref = f"A1:{last_col}{len(rows) + 1}"
 
 
-# Tab color used for the Thought Leadership person tabs, matching the "Corporate"
-# swatch on the Legend tab.
-CORPORATE_TAB_COLOR = Color(theme=9, tint=0.7999816888943144, type="theme")
+# Sheet-tab colors, matching godaddy_data_june_2026.xlsx exactly (theme index + tint).
+SBRL_TAB_COLOR = Color(theme=8, tint=0.7999816888943144, type="theme")
+PRODUCT_TAB_COLOR = Color(theme=4, tint=0.7999816888943144, type="theme")
+ANS_PRODUCT_TAB_COLOR = Color(theme=7, tint=0.7999816888943144, type="theme")  # ANS (Product) + Int. only — an outlier vs. the other Product tabs
+# "Olive Green, Accent 3, Lighter 80%" — used for the Corporate group (Brand,
+# Finance, Thought Leadership person tabs) and ANS Open Standard.
+OLIVE_GREEN_TAB_COLOR = Color(theme=6, tint=0.7999816888943144, type="theme")
+
+TAB_COLOR_BY_TAB = {
+    "GDSBRL + Int.": SBRL_TAB_COLOR,
+    "Commerce (Product) + Int.": PRODUCT_TAB_COLOR,
+    "AGI (Product) + Int.": PRODUCT_TAB_COLOR,
+    "Airo (Product) + Int.": PRODUCT_TAB_COLOR,
+    "ANS (Product) + Int.": ANS_PRODUCT_TAB_COLOR,
+    "Other (Product) + Int.": PRODUCT_TAB_COLOR,
+    "ANS Open Standard": OLIVE_GREEN_TAB_COLOR,
+    "Brand + Int.": OLIVE_GREEN_TAB_COLOR,
+    "Finance + Int.": OLIVE_GREEN_TAB_COLOR,
+    **{tab: OLIVE_GREEN_TAB_COLOR for tab in PEOPLE_TABS.values()},
+}
 
 
 def build_legend_sheet(wb, index: int = 0):
@@ -459,22 +527,26 @@ def build_legend_sheet(wb, index: int = 0):
     ws["B5"].fill = PatternFill("solid", fgColor="FFF2CEEF")
     ws["C5"] = "Keep - Non-T1"
 
-    ws["B7"] = "Tabs"
+    ws["B6"] = "Yellow"
+    ws["B6"].fill = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
+    ws["C6"] = 'Hit Sentence doesn\'t mention "GoDaddy"'
 
-    ws["B8"] = "Pink"
-    ws["B8"].fill = PatternFill("solid", fgColor="FFF2CFEF")
-    ws["C8"] = "SBRL"
+    ws["B8"] = "Tabs"
 
-    ws["B9"] = "Blue"
-    ws["B9"].fill = PatternFill("solid", fgColor="FFC0E5F4")
-    ws["C9"] = "Product"
+    ws["B9"] = "Pink"
+    ws["B9"].fill = PatternFill("solid", fgColor="FFF2CFEF")
+    ws["C9"] = "SBRL"
 
-    ws["B10"] = "Green"
-    ws["B10"].fill = PatternFill(fill_type="solid", fgColor=CORPORATE_TAB_COLOR)
-    ws["C10"] = "Corporate"
+    ws["B10"] = "Blue"
+    ws["B10"].fill = PatternFill("solid", fgColor="FFC0E5F4")
+    ws["C10"] = "Product"
 
-    ws["B11"] = "White"
-    ws["C11"] = "Source of Truth/General"
+    ws["B11"] = "Green"
+    ws["B11"].fill = PatternFill(fill_type="solid", fgColor=OLIVE_GREEN_TAB_COLOR)
+    ws["C11"] = "Corporate"
+
+    ws["B12"] = "White"
+    ws["C12"] = "Source of Truth/General"
 
     return ws
 
@@ -490,13 +562,68 @@ def create_workbook(tab_data: dict[str, list[list]], output_path: str):
     for tab_name in TAB_ORDER:
         rows = tab_data.get(tab_name, [])
         ws = wb.create_sheet(title=tab_name[:31])  # Excel 31-char tab name limit
-        if tab_name in PEOPLE_TABS.values():
-            ws.sheet_properties.tabColor = CORPORATE_TAB_COLOR
+        if tab_name in TAB_COLOR_BY_TAB:
+            ws.sheet_properties.tabColor = TAB_COLOR_BY_TAB[tab_name]
         write_tab(ws, rows)
         print(f"  📄 {tab_name}: {len(rows)} mentions")
 
+    resort_all_tabs(wb)
     wb.save(output_path)
     print(f"\n✅ Saved to {output_path}")
+
+
+def _row_sort_key(cells_info):
+    """Group by data-label color (Orange -> Pink -> everything else), newest first
+    within each group. cells_info is the list of (value, font, fill, border,
+    alignment, number_format) tuples captured for one row; Date is column 1, Time
+    is column 2."""
+    _, _, fill, *_ = cells_info[0]
+    fg = fill.fgColor
+    if fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb == ORANGE_FILL_ARGB:
+        group = 0
+    elif fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb == PINK_FILL_ARGB:
+        group = 1
+    else:
+        group = 2
+
+    date_val = cells_info[0][0]
+    time_val = cells_info[1][0]
+    date_ord = date_val.toordinal() if date_val else 0
+    time_secs = (time_val.hour * 3600 + time_val.minute * 60 + time_val.second) if time_val else 0
+    return (group, -date_ord, -time_secs)
+
+
+def resort_tab(ws):
+    """Re-lay-out a data tab's rows: new T1 (Orange) first, new Non-T1 (Pink) second,
+    then everything else — newest-to-oldest by Date/Time within each group."""
+    if ws.max_row < 3:
+        return  # header only (or a single data row) — nothing to reorder
+
+    max_col = ws.max_column
+    entries = [
+        # cell.font/.fill/.border/.alignment return an immutable StyleProxy; copy()
+        # unwraps it into a real, reassignable style object.
+        [(c.value, copy(c.font), copy(c.fill), copy(c.border), copy(c.alignment), c.number_format) for c in row]
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=max_col)
+    ]
+    entries.sort(key=_row_sort_key)
+
+    for row_idx, cells_info in enumerate(entries, start=2):
+        for col_idx, (value, font, fill, border, alignment, number_format) in enumerate(cells_info, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = font
+            cell.fill = fill
+            cell.border = border
+            cell.alignment = alignment
+            cell.number_format = number_format
+
+
+def resort_all_tabs(wb):
+    """Apply resort_tab to every tab this script manages that exists in the workbook."""
+    for tab_name in TAB_ORDER:
+        ws_name = tab_name[:31]
+        if ws_name in wb.sheetnames:
+            resort_tab(wb[ws_name])
 
 
 def downgrade_reviewed_rows(wb):
@@ -517,6 +644,11 @@ def downgrade_reviewed_rows(wb):
             fg = marker_fill.fgColor
             if marker_fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb in (ORANGE_FILL_ARGB, PINK_FILL_ARGB):
                 for cell in row:
+                    # Leave a Yellow "GoDaddy not found in Hit Sentence" flag in place —
+                    # it's a content-quality flag, not a review-recency one.
+                    cell_fg = cell.fill.fgColor
+                    if cell.fill.fill_type == "solid" and cell_fg.type == "rgb" and cell_fg.rgb == YELLOW_FILL_ARGB:
+                        continue
                     cell.fill = NO_FILL
                 downgraded += 1
     if downgraded:
@@ -560,16 +692,17 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
                     cell = ws.cell(row=row_idx, column=col_idx, value=value)
                     cell.font = CELL_FONT
                     cell.border = THIN_BORDER
-                    cell.fill = fill
+                    cell.fill = _cell_fill(row_data, col_idx, fill)
 
             print(f"  📄 {tab_name}: +{len(new_unique)} new ({len(new_rows) - len(new_unique)} dupes skipped)")
         else:
             ws = wb.create_sheet(title=ws_name)
-            if tab_name in PEOPLE_TABS.values():
-                ws.sheet_properties.tabColor = CORPORATE_TAB_COLOR
+            if tab_name in TAB_COLOR_BY_TAB:
+                ws.sheet_properties.tabColor = TAB_COLOR_BY_TAB[tab_name]
             write_tab(ws, new_rows)
             print(f"  📄 {tab_name}: {len(new_rows)} mentions (new tab)")
 
+    resort_all_tabs(wb)
     wb.save(output_path)
     print(f"\n✅ Saved to {output_path}")
 
