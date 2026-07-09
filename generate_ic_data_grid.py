@@ -56,6 +56,7 @@ STREAMS = [
     {"id": 941789, "label": "Finance",             "tier": "T1",  "group": "CORPORATE", "tab": "Finance + Int.",             "input_name": "GoDaddy - Finance - T1"},
     {"id": 941792, "label": "Thought Leadership",  "tier": "T1",  "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - T1", "split_by_person": True},
     {"id": 964987, "label": "ANS Open Standard",   "tier": "T1",  "group": "ANS_OPEN_STANDARD", "tab": "ANS Open Standard", "input_name": "ANS Open Standard - T1"},
+    {"id": 965728, "label": "Brand Identity",      "tier": "T1",  "group": "BRAND_IDENTITY", "tab": "Brand Identity", "input_name": "Brand Identity - T1"},
     # ── SBRL T1 ───────────────────────────────────────────────────────
     {"id": 941796, "label": "sbrl", "tier": "T1",     "group": "SBRL", "tab": "GDSBRL + Int.", "input_name": "GoDaddy Venture Forward - T1"},
     # ── PRODUCTS (Non-T1) ─────────────────────────────────────────────
@@ -69,6 +70,7 @@ STREAMS = [
     {"id": 943641, "label": "Finance",             "tier": "Non-T1", "group": "CORPORATE", "tab": "Finance + Int.",             "input_name": "GoDaddy - Finance - Non T1"},
     {"id": 943642, "label": "Thought Leadership",  "tier": "Non-T1", "group": "CORPORATE", "tab": "Thought Leadership + Int.",  "input_name": "GoDaddy Thought Leadership - Non T1", "split_by_person": True},
     {"id": 964967, "label": "ANS Open Standard",   "tier": "Non-T1", "group": "ANS_OPEN_STANDARD", "tab": "ANS Open Standard", "input_name": "ANS Open Standard - Non T1"},
+    {"id": 965727, "label": "Brand Identity",      "tier": "Non-T1", "group": "BRAND_IDENTITY", "tab": "Brand Identity", "input_name": "Brand Identity - Non T1"},
     # ── SBRL (Non-T1) ────────────────────────────────────────────────
     {"id": 943644, "label": "sblr", "tier": "Non-T1", "group": "SBRL", "tab": "GDSBRL + Int.", "input_name": "GoDaddy Venture Forward - Non T1"},
 ]
@@ -104,7 +106,9 @@ TAB_ORDER = [
     "ANS Open Standard",
     "Brand + Int.",
     "Finance + Int.",
-] + list(PEOPLE_TABS.values())
+] + list(PEOPLE_TABS.values()) + [
+    "Brand Identity",  # left uncolored (no entry in TAB_COLOR_BY_TAB) — sits at the end
+]
 
 # The 42 columns matching the existing IC Data grid
 IC_COLUMNS = [
@@ -118,7 +122,6 @@ IC_COLUMNS = [
     "Comments", "Reactions", "Views", "Estimated Views",
     "Document Tags", "Custom Categories",
 ]
-HIT_SENTENCE_COL_IDX = IC_COLUMNS.index("Hit Sentence")  # 0-based
 
 # Column widths for readability
 COL_WIDTHS = {
@@ -424,32 +427,28 @@ THIN_BORDER = Border(
 )
 
 # Data-label row fills, matching the Legend tab: Orange = new T1 data to review,
-# Pink = new Non-T1 data to review. Red ("Removed") is a manual designation this
-# script never applies and never clears. NO_FILL is used to "age out" a row from
-# Orange/Pink to White once it's no longer new.
+# Pink = new Non-T1 data to review. Yellow overrides both — it means the mention
+# was flagged by focus_hit_sentence ("GoDaddy" never turned up in the Hit Sentence
+# text) and needs a human look, so it takes priority over the tier color. Red
+# ("Removed") is a manual designation this script never applies and never clears.
+# NO_FILL is used to "age out" a row from Orange/Pink to White once it's no longer new.
 ORANGE_FILL_ARGB = "FFFBE2D5"
 PINK_FILL_ARGB = "FFF2CEEF"
 RED_FILL_ARGB = "FFFF0000"
 YELLOW_FILL_ARGB = "FFFFFF00"
 ORANGE_FILL = PatternFill("solid", fgColor=ORANGE_FILL_ARGB)
 PINK_FILL = PatternFill("solid", fgColor=PINK_FILL_ARGB)
-# Standard Yellow — flags a Hit Sentence where the focus keyword ("GoDaddy") never
-# turned up in Cision's excerpt/transcript at all (see focus_hit_sentence).
 YELLOW_FILL = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
 NO_FILL = PatternFill(fill_type=None)
 
 
-def _row_tier_fill(row_data: list) -> PatternFill:
-    """Custom Categories (last column) is "Y" only for T1 rows (see mention_to_row)."""
-    return ORANGE_FILL if row_data[-1] == "Y" else PINK_FILL
-
-
-def _cell_fill(row_data: list, col_idx: int, row_fill: PatternFill) -> PatternFill:
-    """The Hit Sentence cell gets Yellow instead of the row's Orange/Pink/etc. fill
-    when its Row was flagged by focus_hit_sentence (see Row/mention_to_row)."""
-    if col_idx - 1 == HIT_SENTENCE_COL_IDX and getattr(row_data, "hit_sentence_flagged", False):
+def _row_fill(row_data: list) -> PatternFill:
+    """Yellow if focus_hit_sentence flagged this row (see Row/mention_to_row),
+    otherwise the tier color: Custom Categories (last column) is "Y" only for
+    T1 rows."""
+    if getattr(row_data, "hit_sentence_flagged", False):
         return YELLOW_FILL
-    return row_fill
+    return ORANGE_FILL if row_data[-1] == "Y" else PINK_FILL
 
 
 def write_tab(ws, rows: list[list]):
@@ -465,12 +464,12 @@ def write_tab(ws, rows: list[list]):
     rows_sorted = sorted(rows, key=lambda r: (r[0] or datetime.min.date(), r[1] or datetime.min.time()), reverse=True)
 
     for row_idx, row_data in enumerate(rows_sorted, start=2):
-        fill = _row_tier_fill(row_data)
+        fill = _row_fill(row_data)
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = CELL_FONT
             cell.border = THIN_BORDER
-            cell.fill = _cell_fill(row_data, col_idx, fill)
+            cell.fill = fill
 
     # Column widths
     for col_letter, width in COL_WIDTHS.items():
@@ -573,18 +572,20 @@ def create_workbook(tab_data: dict[str, list[list]], output_path: str):
 
 
 def _row_sort_key(cells_info):
-    """Group by data-label color (Orange -> Pink -> everything else), newest first
-    within each group. cells_info is the list of (value, font, fill, border,
-    alignment, number_format) tuples captured for one row; Date is column 1, Time
-    is column 2."""
+    """Group by data-label color (Orange -> Pink -> Yellow -> everything else),
+    newest first within each group. cells_info is the list of (value, font, fill,
+    border, alignment, number_format) tuples captured for one row; Date is column
+    1, Time is column 2."""
     _, _, fill, *_ = cells_info[0]
     fg = fill.fgColor
     if fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb == ORANGE_FILL_ARGB:
         group = 0
     elif fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb == PINK_FILL_ARGB:
         group = 1
-    else:
+    elif fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb == YELLOW_FILL_ARGB:
         group = 2
+    else:
+        group = 3
 
     date_val = cells_info[0][0]
     time_val = cells_info[1][0]
@@ -594,8 +595,9 @@ def _row_sort_key(cells_info):
 
 
 def resort_tab(ws):
-    """Re-lay-out a data tab's rows: new T1 (Orange) first, new Non-T1 (Pink) second,
-    then everything else — newest-to-oldest by Date/Time within each group."""
+    """Re-lay-out a data tab's rows: new T1 (Orange) first, new Non-T1 (Pink)
+    second, flagged new data (Yellow) third, then everything else — newest-to-oldest
+    by Date/Time within each group."""
     if ws.max_row < 3:
         return  # header only (or a single data row) — nothing to reorder
 
@@ -628,9 +630,11 @@ def resort_all_tabs(wb):
 
 def downgrade_reviewed_rows(wb):
     """Age out last run's "new data" highlighting: any row still filled Orange or Pink
-    (Keep - T1 / Keep - Non-T1) is cleared to White now that it's no longer new. Rows
-    filled Red (Removed) are a manual designation and are left untouched. Only scans
-    tabs this script manages (not foreign/manual sheets in the workbook)."""
+    (Keep - T1 / Keep - Non-T1) is cleared to White now that it's no longer new.
+    Yellow (flagged: "GoDaddy" not found in Hit Sentence) is a standing content-quality
+    flag, not a review-recency one — like Red (Removed), it's left untouched until a
+    human resolves it. Only scans tabs this script manages (not foreign/manual sheets
+    in the workbook)."""
     downgraded = 0
     for tab_name in TAB_ORDER:
         ws_name = tab_name[:31]
@@ -644,11 +648,6 @@ def downgrade_reviewed_rows(wb):
             fg = marker_fill.fgColor
             if marker_fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb in (ORANGE_FILL_ARGB, PINK_FILL_ARGB):
                 for cell in row:
-                    # Leave a Yellow "GoDaddy not found in Hit Sentence" flag in place —
-                    # it's a content-quality flag, not a review-recency one.
-                    cell_fg = cell.fill.fgColor
-                    if cell.fill.fill_type == "solid" and cell_fg.type == "rgb" and cell_fg.rgb == YELLOW_FILL_ARGB:
-                        continue
                     cell.fill = NO_FILL
                 downgraded += 1
     if downgraded:
@@ -683,16 +682,16 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
             # Filter out duplicates
             new_unique = [r for r in new_rows if r[2] not in existing_ids]
 
-            # Append new rows at the bottom, tagged Orange/Pink as new data to review
+            # Append new rows at the bottom, tagged Orange/Pink/Yellow as new data to review
             start_row = ws.max_row + 1
             for offset, row_data in enumerate(new_unique):
                 row_idx = start_row + offset
-                fill = _row_tier_fill(row_data)
+                fill = _row_fill(row_data)
                 for col_idx, value in enumerate(row_data, start=1):
                     cell = ws.cell(row=row_idx, column=col_idx, value=value)
                     cell.font = CELL_FONT
                     cell.border = THIN_BORDER
-                    cell.fill = _cell_fill(row_data, col_idx, fill)
+                    cell.fill = fill
 
             print(f"  📄 {tab_name}: +{len(new_unique)} new ({len(new_rows) - len(new_unique)} dupes skipped)")
         else:
