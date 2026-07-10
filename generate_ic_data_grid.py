@@ -12,8 +12,17 @@ Usage:
     python generate_ic_data_grid.py --after 2026-06-01 --before 2026-06-11 \
         --append-to GoDaddy_IC_Data_-_2026.xlsx
 
+    # Also re-check Yellow-flagged mentions against the full article text
+    # (fetches each flagged mention's own URL — off by default, adds runtime):
+    python generate_ic_data_grid.py --after 2026-05-01 --before 2026-06-01 --fetch-full-text
+
 Requirements:
-    pip install requests openpyxl python-dateutil
+    pip install requests openpyxl python-dateutil beautifulsoup4 lxml
+
+    Optional, only used by --fetch-full-text as upgrades over plain `requests`
+    (both are skipped silently if absent):
+        export TAVILY_API_KEY="your-tavily-key"   # best at paywalls/bot-detection
+        pip install curl_cffi                     # Chrome TLS-fingerprint spoofing
 """
 
 import argparse
@@ -29,6 +38,7 @@ from urllib.parse import urlparse
 from collections import defaultdict
 
 import openpyxl
+from bs4 import BeautifulSoup
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.styles.colors import Color
 from openpyxl.utils import get_column_letter
@@ -329,14 +339,151 @@ def focus_hit_sentence(text: str, keyword: str = "GoDaddy") -> tuple[str, bool]:
     return text, True
 
 
+# ============================================================================
+# FULL-ARTICLE FALLBACK (--fetch-full-text)
+# ============================================================================
+# Cision's excerpt is a single fixed snippet — if "GoDaddy" isn't in it, that
+# doesn't mean the article never mentions GoDaddy, just that Cision's snippet
+# didn't happen to land there. For mentions flagged Yellow, we can fetch the
+# article's own public URL and search the real full text ourselves, the same
+# way mention_review_streamlit/app.py does for old Meltwater data (fetch ->
+# strip to body text -> split into sentences -> find the one with "GoDaddy").
+
+ARTICLE_FETCH_TIMEOUT = 15
+ARTICLE_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+ARTICLE_FETCH_DELAY = 1.0  # seconds between fetches, so we don't hammer news sites
+
+# Optional, in priority order: Tavily's Extract API (best at paywalls/bot-detection,
+# no local browser needed — set TAVILY_API_KEY to enable) and curl_cffi (mimics
+# Chrome's TLS fingerprint, gets past a lot of basic bot-blocking WAFs). Both are
+# skipped silently if unconfigured/not installed — plain `requests` always runs last.
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+
+_ABBREV_RE = re.compile(r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|approx|Inc|Ltd|Corp|Co)\.")
+_ROBUST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'‘’“”\(\[])")
+
+
+def _split_sentences_robust(text: str) -> list[str]:
+    """Sentence splitter for full article bodies — tolerant of abbreviations
+    ("Inc.", "Corp.", etc.) that would otherwise cause false splits. Ported from
+    mention_review_streamlit/app.py's split_sentences()."""
+    text = re.sub(r"\s+", " ", text).strip()
+    text = _ABBREV_RE.sub(r"\1<DOT>", text)
+    parts = _ROBUST_SENTENCE_SPLIT_RE.split(text)
+    return [p.replace("<DOT>", ".").strip() for p in parts if p.strip()]
+
+
+def _extract_article_text(html: str) -> str:
+    """Best-effort article body extraction. Ported from
+    mention_review_streamlit/app.py's extract_article_text()."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside",
+                     "noscript", "iframe", "form"]):
+        tag.decompose()
+    for selector in [
+        "article", "main", '[role="main"]', ".post-content", ".entry-content",
+        ".article-body", ".story-body", ".article__body", ".content-body",
+        "#article-body", ".post-body",
+    ]:
+        container = soup.select_one(selector)
+        if container:
+            text = container.get_text(separator=" ", strip=True)
+            if len(text) > 200:
+                return text
+    body = soup.find("body")
+    return (body or soup).get_text(separator=" ", strip=True)
+
+
+def _fetch_via_tavily(url: str) -> str | None:
+    """Fetch article text via Tavily's Extract API. Returns None if TAVILY_API_KEY
+    isn't set or the call fails — this is a silent, optional upgrade."""
+    if not TAVILY_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            TAVILY_EXTRACT_URL,
+            json={"urls": [url], "extract_depth": "advanced", "format": "text"},
+            headers={"Authorization": f"Bearer {TAVILY_API_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if results:
+            return results[0].get("raw_content", "") or results[0].get("content", "") or None
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_via_curl_cffi(url: str) -> str | None:
+    """Fetch via curl_cffi (Chrome TLS-fingerprint impersonation) if it's installed.
+    Returns None if the package is missing or the fetch fails."""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return None
+    try:
+        resp = cffi_requests.get(url, impersonate="chrome120", timeout=ARTICLE_FETCH_TIMEOUT, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        return _extract_article_text(resp.text)
+    except Exception:
+        return None
+
+
+def fetch_full_article_text(url: str) -> str | None:
+    """Best-effort fetch of the full article body at `url`, trying (in order)
+    Tavily's Extract API, curl_cffi, then plain `requests`. Returns None if every
+    method fails — callers must fall back gracefully; this is a bonus check, not
+    something the pipeline depends on."""
+    text = _fetch_via_tavily(url)
+    if text:
+        return text
+
+    text = _fetch_via_curl_cffi(url)
+    if text:
+        return text
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": ARTICLE_FETCH_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=ARTICLE_FETCH_TIMEOUT,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return None
+        return _extract_article_text(resp.text)
+    except Exception:
+        return None
+
+
+def find_keyword_sentence(text: str, keyword: str = "GoDaddy") -> str | None:
+    """Locate the first sentence in a full article body mentioning `keyword`.
+    Returns None if it isn't there either."""
+    if not text or keyword.lower() not in text.lower():
+        return None
+    for sentence in _split_sentences_robust(text):
+        if keyword.lower() in sentence.lower():
+            return sentence.strip()
+    return None
+
+
 class Row(list):
     """A data row that also remembers whether its Hit Sentence should be flagged
     Yellow (the focus keyword never turned up in Cision's excerpt/transcript)."""
     hit_sentence_flagged = False
 
 
-def mention_to_row(mention: dict, stream_config: dict) -> list:
-    """Convert a single API mention + stream metadata → 42-element list matching IC_COLUMNS."""
+def mention_to_row(mention: dict, stream_config: dict, fetch_full_text: bool = False) -> list:
+    """Convert a single API mention + stream metadata → 42-element list matching
+    IC_COLUMNS. If fetch_full_text is set and Cision's excerpt doesn't mention
+    "GoDaddy", makes one best-effort fetch of the mention's own public URL and
+    searches the real article body before giving up and flagging Yellow."""
     pub = mention.get("publishedAt", "")
     dt = None
     if pub:
@@ -360,6 +507,13 @@ def mention_to_row(mention: dict, stream_config: dict) -> list:
     hit_sentence_flagged = False
     if stream_config["tab"] != "ANS Open Standard":
         content_text, keyword_found = focus_hit_sentence(content_text, "GoDaddy")
+        if not keyword_found and fetch_full_text and mention.get("url"):
+            time.sleep(ARTICLE_FETCH_DELAY)
+            full_text = fetch_full_article_text(mention["url"])
+            better_sentence = find_keyword_sentence(full_text, "GoDaddy") if full_text else None
+            if better_sentence:
+                content_text = better_sentence
+                keyword_found = True
         hit_sentence_flagged = not keyword_found
 
     # Fall back to Cision's internal link when the mention has no public URL
@@ -441,12 +595,18 @@ PINK_FILL = PatternFill("solid", fgColor=PINK_FILL_ARGB)
 YELLOW_FILL = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
 NO_FILL = PatternFill(fill_type=None)
 
+# Toggle for the Yellow "GoDaddy not found in Hit Sentence" row highlight. Set to
+# True to re-enable it — mention_to_row/focus_hit_sentence/fetch_full_article_text
+# still run and compute Row.hit_sentence_flagged either way, this just controls
+# whether that flag is allowed to affect row color (and the Legend entry).
+ENABLE_YELLOW_HIGHLIGHTING = False
+
 
 def _row_fill(row_data: list) -> PatternFill:
-    """Yellow if focus_hit_sentence flagged this row (see Row/mention_to_row),
-    otherwise the tier color: Custom Categories (last column) is "Y" only for
-    T1 rows."""
-    if getattr(row_data, "hit_sentence_flagged", False):
+    """Yellow if focus_hit_sentence flagged this row (see Row/mention_to_row) and
+    ENABLE_YELLOW_HIGHLIGHTING is on, otherwise the tier color: Custom Categories
+    (last column) is "Y" only for T1 rows."""
+    if ENABLE_YELLOW_HIGHLIGHTING and getattr(row_data, "hit_sentence_flagged", False):
         return YELLOW_FILL
     return ORANGE_FILL if row_data[-1] == "Y" else PINK_FILL
 
@@ -526,9 +686,10 @@ def build_legend_sheet(wb, index: int = 0):
     ws["B5"].fill = PatternFill("solid", fgColor="FFF2CEEF")
     ws["C5"] = "Keep - Non-T1"
 
-    ws["B6"] = "Yellow"
-    ws["B6"].fill = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
-    ws["C6"] = 'Hit Sentence doesn\'t mention "GoDaddy"'
+    if ENABLE_YELLOW_HIGHLIGHTING:
+        ws["B6"] = "Yellow"
+        ws["B6"].fill = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
+        ws["C6"] = 'Hit Sentence doesn\'t mention "GoDaddy"'
 
     ws["B8"] = "Tabs"
 
@@ -710,11 +871,12 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
 # MAIN PIPELINE
 # ============================================================================
 
-def fetch_all_streams(client: CisionOneClient, after: str, before: str) -> dict[str, list[list]]:
+def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_full_text: bool = False) -> dict[str, list[list]]:
     """Fetch mentions from all 18 streams and organize by tab."""
     tab_data: dict[str, list[list]] = defaultdict(list)
     total_mentions = 0
     unmatched_person_mentions = 0
+    flagged_count = 0
 
     for i, stream in enumerate(STREAMS, start=1):
         sid = stream["id"]
@@ -741,13 +903,16 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str) -> dict[
                 if not person_tabs:
                     unmatched_person_mentions += 1
                     continue
-                row = mention_to_row(m, stream)
+                row = mention_to_row(m, stream, fetch_full_text=fetch_full_text)
+                if row.hit_sentence_flagged:
+                    flagged_count += 1
                 for person_tab in person_tabs:
                     tab_data[person_tab].append(row)
                 matched += 1
             print(f"    ✓ {len(mentions)} mentions → routed {matched} to person tabs")
         else:
-            rows = [mention_to_row(m, stream) for m in mentions]
+            rows = [mention_to_row(m, stream, fetch_full_text=fetch_full_text) for m in mentions]
+            flagged_count += sum(1 for r in rows if r.hit_sentence_flagged)
             tab_data[tab].extend(rows)
             print(f"    ✓ {len(mentions)} mentions")
 
@@ -755,6 +920,9 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str) -> dict[
 
     if unmatched_person_mentions:
         print(f"\n⚠️  {unmatched_person_mentions} Thought Leadership mention(s) didn't match any known person and were skipped")
+    if flagged_count:
+        suffix = " even after checking the full article" if fetch_full_text else " (run with --fetch-full-text to double-check the full article)"
+        print(f"\n🟡 {flagged_count} mention(s) flagged Yellow — \"GoDaddy\" not found{suffix}")
 
     # Deduplicate within each tab (same article can appear in T1 and Non-T1 with different Input Names)
     # We keep both since they have different Input Names — that's intentional per the grid design
@@ -769,6 +937,12 @@ def main():
     parser.add_argument("--output", default=None, help="Output file path (default: GoDaddy_IC_Data_<after>_to_<before>.xlsx)")
     parser.add_argument("--append-to", default=None, help="Path to existing workbook to append to")
     parser.add_argument("--token", default=None, help="Cision One API token (or set CISION_API_TOKEN env var)")
+    parser.add_argument(
+        "--fetch-full-text", action="store_true",
+        help="For mentions flagged Yellow (\"GoDaddy\" not in Cision's excerpt), fetch the "
+             "mention's own URL and re-check the full article text before giving up. Off by "
+             "default — adds one HTTP request per flagged mention.",
+    )
     args = parser.parse_args()
 
     token = args.token or os.environ.get("CISION_API_TOKEN")
@@ -786,10 +960,11 @@ def main():
     print(f"  Streams: {len(STREAMS)}")
     print(f"  Rate limit: ~10 req/min ({REQUEST_INTERVAL}s between requests)")
     print(f"  Mode: {'Append' if args.append_to else 'New workbook'}")
+    print(f"  Full-text re-check for flagged mentions: {'On' if args.fetch_full_text else 'Off'}")
     print()
 
     client = CisionOneClient(api_token=token)
-    tab_data = fetch_all_streams(client, after_iso, before_iso)
+    tab_data = fetch_all_streams(client, after_iso, before_iso, fetch_full_text=args.fetch_full_text)
 
     if args.append_to:
         output_path = args.output or args.append_to
