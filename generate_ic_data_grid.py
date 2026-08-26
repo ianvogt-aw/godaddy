@@ -21,6 +21,11 @@ Usage:
     # fetchable) — pass --no-llm-review to skip this and save time/cost:
     python generate_ic_data_grid.py --after 2026-05-01 --before 2026-06-01 --no-llm-review
 
+    # Drop CisionOne website CSV report exports into cision_exports/ (or point
+    # --cision-exports-dir elsewhere) to enrich Reach/Title/Hit Sentence — see
+    # the "CISION WEBSITE CSV EXPORT ENRICHMENT" section below for the join rule:
+    python generate_ic_data_grid.py --after 2026-05-01 --before 2026-06-01 --cision-exports-dir cision_exports
+
 Requirements:
     pip install requests openpyxl python-dateutil beautifulsoup4 lxml boto3
 
@@ -36,6 +41,8 @@ Requirements:
 """
 
 import argparse
+import csv
+import glob
 import os
 import re
 import sys
@@ -171,8 +178,11 @@ COL_WIDTHS = {
 # Fixed column indices (0-based) used both when building a row and when reading
 # one back — kept as named lookups instead of magic numbers/[-1] so adding
 # trailing columns (like the review ones above) never silently shifts meaning.
+DOCUMENT_ID_COL_IDX = IC_COLUMNS.index("Document ID")
 URL_COL_IDX = IC_COLUMNS.index("URL")
+TITLE_COL_IDX = IC_COLUMNS.index("Title")
 HIT_SENTENCE_COL_IDX = IC_COLUMNS.index("Hit Sentence")
+REACH_COL_IDX = IC_COLUMNS.index("Reach")
 REVIEW_EVIDENCE_COL_IDX = IC_COLUMNS.index("Review Evidence")
 REVIEW_CLASSIFICATION_COL_IDX = IC_COLUMNS.index("Review Classification")
 REVIEW_JUSTIFICATION_COL_IDX = IC_COLUMNS.index("Review Justification")
@@ -352,36 +362,16 @@ def map_language_code(code: str) -> str:
     return lang_map.get(code, lang_map.get(code.split("-")[0], code))
 
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-
-
-def focus_hit_sentence(text: str, keyword: str = "GoDaddy") -> tuple[str, bool]:
-    """Prefer the sentence mentioning `keyword` over Cision's raw excerpt/transcript
-    blob. The API only gives us one fixed excerpt with no keyword offsets or full
-    article body, so this can only re-center within text Cision already returned —
-    if `keyword` isn't present anywhere in it, the text is returned unchanged.
-    Returns (text, found) so callers can flag mentions where `keyword` never
-    turned up at all."""
-    if not text:
-        return text, False
-    found = keyword.lower() in text.lower()
-    if not found:
-        return text, False
-    for sentence in _SENTENCE_SPLIT_RE.split(text):
-        if keyword.lower() in sentence.lower():
-            return sentence.strip(), True
-    return text, True
-
-
 # ============================================================================
 # FULL-ARTICLE FALLBACK (--fetch-full-text)
 # ============================================================================
 # Cision's excerpt is a single fixed snippet — if "GoDaddy" isn't in it, that
 # doesn't mean the article never mentions GoDaddy, just that Cision's snippet
 # didn't happen to land there. For mentions flagged Yellow, we can fetch the
-# article's own public URL and search the real full text ourselves, the same
-# way mention_review_streamlit/app.py does for old Meltwater data (fetch ->
-# strip to body text -> split into sentences -> find the one with "GoDaddy").
+# article's own public URL and check the real full text ourselves for whether
+# "GoDaddy" shows up anywhere in it (fetch -> strip to body text -> substring
+# search). Hit Sentence itself always stays the raw Cision excerpt/transcript —
+# this fetch only updates the flag, never the cell content.
 
 ARTICLE_FETCH_TIMEOUT = 15
 ARTICLE_FETCH_USER_AGENT = (
@@ -396,20 +386,6 @@ ARTICLE_FETCH_DELAY = 1.0  # seconds between fetches, so we don't hammer news si
 # skipped silently if unconfigured/not installed — plain `requests` always runs last.
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
-
-_ABBREV_RE = re.compile(r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|approx|Inc|Ltd|Corp|Co)\.")
-_ROBUST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'‘’“”\(\[])")
-
-
-def _split_sentences_robust(text: str) -> list[str]:
-    """Sentence splitter for full article bodies — tolerant of abbreviations
-    ("Inc.", "Corp.", etc.) that would otherwise cause false splits. Ported from
-    mention_review_streamlit/app.py's split_sentences()."""
-    text = re.sub(r"\s+", " ", text).strip()
-    text = _ABBREV_RE.sub(r"\1<DOT>", text)
-    parts = _ROBUST_SENTENCE_SPLIT_RE.split(text)
-    return [p.replace("<DOT>", ".").strip() for p in parts if p.strip()]
-
 
 def _extract_article_text(html: str) -> str:
     """Best-effort article body extraction. Ported from
@@ -496,32 +472,24 @@ def fetch_full_article_text(url: str) -> str | None:
         return None
 
 
-def find_keyword_sentence(text: str, keyword: str = "GoDaddy") -> str | None:
-    """Locate the first sentence in a full article body mentioning `keyword`.
-    Returns None if it isn't there either."""
-    if not text or keyword.lower() not in text.lower():
-        return None
-    for sentence in _split_sentences_robust(text):
-        if keyword.lower() in sentence.lower():
-            return sentence.strip()
-    return None
-
-
 class Row(list):
     """A data row that also carries metadata alongside its 46 IC_COLUMNS values:
     is_t1 is the single source of truth for both the Custom Categories value and
     the base Orange/Pink fill (see mention_to_row/_row_fill). hit_sentence_flagged
-    records whether focus_hit_sentence had to give up on finding "GoDaddy" in
-    Cision's excerpt — it only affects Hit Sentence content, not row color."""
+    records whether "GoDaddy" was never found in Cision's excerpt/transcript (or
+    the full article, if re-checked) — it's a reporting flag only and never
+    changes Hit Sentence content or row color."""
     is_t1 = False
     hit_sentence_flagged = False
 
 
 def mention_to_row(mention: dict, stream_config: dict, fetch_full_text: bool = False) -> list:
     """Convert a single API mention + stream metadata → 46-element list matching
-    IC_COLUMNS. If fetch_full_text is set and Cision's excerpt doesn't mention
-    "GoDaddy", makes one best-effort fetch of the mention's own public URL and
-    searches the real article body before giving up on the Hit Sentence rewrite."""
+    IC_COLUMNS. Hit Sentence is always Cision's raw excerpt (or transcript, for
+    media types that only carry one) — never rewritten. If fetch_full_text is set
+    and neither field mentions "GoDaddy", makes one best-effort fetch of the
+    mention's own public URL and checks the real article body before flagging
+    the row as Yellow-eligible."""
     is_t1 = stream_config["tier"] == "T1"
 
     pub = mention.get("publishedAt", "")
@@ -543,17 +511,16 @@ def mention_to_row(mention: dict, stream_config: dict, fetch_full_text: bool = F
     keywords_raw = mention.get("keywords") or []
     keywords_str = ";".join(keywords_raw) if keywords_raw else ""
 
+    # Hit Sentence is always the raw Cision field, unmodified — one of these two
+    # should be blank in all cases, so this is really "whichever one is filled."
     content_text = mention.get("excerpt") or mention.get("transcript") or ""
     hit_sentence_flagged = False
     if stream_config["tab"] not in NO_GODADDY_FOCUS_TABS:
-        content_text, keyword_found = focus_hit_sentence(content_text, "GoDaddy")
+        keyword_found = "godaddy" in content_text.lower()
         if not keyword_found and fetch_full_text and mention.get("url"):
             time.sleep(ARTICLE_FETCH_DELAY)
             full_text = fetch_full_article_text(mention["url"])
-            better_sentence = find_keyword_sentence(full_text, "GoDaddy") if full_text else None
-            if better_sentence:
-                content_text = better_sentence
-                keyword_found = True
+            keyword_found = bool(full_text and "godaddy" in full_text.lower())
         hit_sentence_flagged = not keyword_found
 
     # Fall back to Cision's internal link when the mention has no public URL
@@ -611,6 +578,89 @@ def mention_to_row(mention: dict, stream_config: dict, fetch_full_text: bool = F
     row.hit_sentence_flagged = hit_sentence_flagged
     row.is_t1 = is_t1
     return row
+
+
+# ============================================================================
+# CISION WEBSITE CSV EXPORT ENRICHMENT (--cision-exports-dir, on by default)
+# ============================================================================
+# The CisionOne API's own "audience" figure is 0 for the vast majority of
+# online-news mentions (confirmed empirically — see GoDaddy_EarlyJuly26_Cision.xlsx
+# investigation), but the CisionOne *website's* own CSV report export carries a
+# "Potential Audience" column that's actually populated. Those reports also
+# expose a "Media ID" per mention that's the same identifier as the API's
+# Document ID, just with a 2-letter type-code prefix (e.g. "ON4699244747" is
+# Document ID 4699244747 from an Online mention; "TC.../PR.../MA..." etc. for
+# other media types) — confirmed by cross-referencing a real export against a
+# real API-generated grid.
+#
+# This enriches API-pulled rows by left-joining them onto whatever export CSVs
+# are sitting in a folder (cision_exports/ by default) — the API data is always
+# the anchor; unmatched rows are simply left alone.
+
+CSV_EXPORT_MEDIA_ID_PREFIX_LEN = 2  # e.g. "ON4699244747" -> Document ID "4699244747"
+
+
+def load_cision_exports(folder: str = "cision_exports") -> dict[str, dict]:
+    """Scan `folder` for CisionOne website CSV report exports (identified by
+    having a "Media ID" column, not by filename) and build a Document ID -> CSV
+    row lookup. A missing folder/no CSVs is not an error — this enrichment is
+    entirely optional and best-effort."""
+    lookup: dict[str, dict] = {}
+    if not os.path.isdir(folder):
+        print(f"  ℹ️  No '{folder}/' folder found — skipping CSV export enrichment")
+        return lookup
+
+    csv_paths = sorted(glob.glob(os.path.join(folder, "*.csv")))
+    if not csv_paths:
+        print(f"  ℹ️  No CSV files in '{folder}/' — skipping CSV export enrichment")
+        return lookup
+
+    files_used = 0
+    for path in csv_paths:
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames or "Media ID" not in reader.fieldnames:
+                    continue  # not a mention-stream export — skip silently
+                files_used += 1
+                for row in reader:
+                    media_id = (row.get("Media ID") or "").strip()
+                    doc_id = media_id[CSV_EXPORT_MEDIA_ID_PREFIX_LEN:]
+                    if doc_id.isdigit():
+                        lookup[doc_id] = row
+        except Exception as e:
+            print(f"  ⚠️  Could not read {path}: {e}")
+
+    print(f"  📂 Loaded {len(lookup)} row(s) from {files_used} CisionOne export CSV(s) in '{folder}/'")
+    return lookup
+
+
+def enrich_row_from_csv_export(row: list, csv_lookup: dict) -> None:
+    """Left-join a Row onto csv_lookup by Document ID and mutate it in place.
+    Reach is always overwritten from the export's Potential Audience when
+    matched (the API's own figure is frequently 0/unreliable — see module
+    comment above). Title/Hit Sentence only get filled from the export's
+    Headline/Summary as a last resort, when every previously-implemented
+    fallback already left them blank."""
+    if not csv_lookup:
+        return
+    csv_row = csv_lookup.get(str(row[DOCUMENT_ID_COL_IDX] or ""))
+    if csv_row is None:
+        return
+
+    potential_audience = (csv_row.get("Potential Audience") or "").strip()
+    if potential_audience.isdigit():
+        row[REACH_COL_IDX] = int(potential_audience)
+
+    if not row[TITLE_COL_IDX]:
+        headline = (csv_row.get("Headline") or "").strip()
+        if headline:
+            row[TITLE_COL_IDX] = headline
+
+    if not row[HIT_SENTENCE_COL_IDX]:
+        summary = (csv_row.get("Summary") or "").strip()
+        if summary:
+            row[HIT_SENTENCE_COL_IDX] = summary
 
 
 # ============================================================================
@@ -1226,7 +1276,7 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
 # MAIN PIPELINE
 # ============================================================================
 
-def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_full_text: bool = False) -> dict[str, list[list]]:
+def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_full_text: bool = False, csv_lookup: dict | None = None) -> dict[str, list[list]]:
     """Fetch mentions from all 18 streams and organize by tab."""
     tab_data: dict[str, list[list]] = defaultdict(list)
     total_mentions = 0
@@ -1259,6 +1309,7 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_fu
                     unmatched_person_mentions += 1
                     continue
                 row = mention_to_row(m, stream, fetch_full_text=fetch_full_text)
+                enrich_row_from_csv_export(row, csv_lookup)
                 if row.hit_sentence_flagged:
                     flagged_count += 1
                 for person_tab in person_tabs:
@@ -1267,6 +1318,8 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_fu
             print(f"    ✓ {len(mentions)} mentions → routed {matched} to person tabs")
         else:
             rows = [mention_to_row(m, stream, fetch_full_text=fetch_full_text) for m in mentions]
+            for row in rows:
+                enrich_row_from_csv_export(row, csv_lookup)
             flagged_count += sum(1 for r in rows if r.hit_sentence_flagged)
             tab_data[tab].extend(rows)
             print(f"    ✓ {len(mentions)} mentions")
@@ -1304,6 +1357,13 @@ def main():
              "the full article text where fetchable (Bedrock Claude). On by default — pass "
              "--no-llm-review to skip it. Requires AWS credentials with Bedrock access.",
     )
+    parser.add_argument(
+        "--cision-exports-dir", default="cision_exports",
+        help="Folder of CisionOne website CSV report exports (Media ID column) to left-join "
+             "onto API rows by Document ID, enriching Reach (always) and Title/Hit Sentence "
+             "(only if still blank after every other fallback). Default: cision_exports/ "
+             "— missing folder/no CSVs just skips this enrichment.",
+    )
     args = parser.parse_args()
 
     token = args.token or os.environ.get("CISION_API_TOKEN")
@@ -1315,6 +1375,7 @@ def main():
     before_iso = f"{args.before}T23:59:59.000Z"
 
     bedrock_client = build_bedrock_client() if args.llm_review else None
+    csv_lookup = load_cision_exports(args.cision_exports_dir)
 
     print("=" * 60)
     print("  GoDaddy IC Data Grid Generator")
@@ -1325,10 +1386,11 @@ def main():
     print(f"  Mode: {'Append' if args.append_to else 'New workbook'}")
     print(f"  Full-text re-check for flagged mentions: {'On' if args.fetch_full_text else 'Off'}")
     print(f"  LLM review of new mentions: {'On (' + BEDROCK_MODEL_ID + ')' if bedrock_client else 'Off'}")
+    print(f"  CisionOne CSV export enrichment: {len(csv_lookup)} mention(s) available from '{args.cision_exports_dir}/'")
     print()
 
     client = CisionOneClient(api_token=token)
-    tab_data = fetch_all_streams(client, after_iso, before_iso, fetch_full_text=args.fetch_full_text)
+    tab_data = fetch_all_streams(client, after_iso, before_iso, fetch_full_text=args.fetch_full_text, csv_lookup=csv_lookup)
 
     if args.append_to:
         output_path = args.output or args.append_to

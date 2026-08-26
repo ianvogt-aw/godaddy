@@ -3,6 +3,9 @@ import pandas as pd
 import openpyxl
 import json
 import boto3
+import time
+import random
+from botocore.exceptions import ClientError
 from io import BytesIO
 from datetime import date
 
@@ -282,22 +285,37 @@ CLAUDE_MODEL_ID = st.secrets["BEDROCK_MODEL_ID"]
 # ──────────────────────────────────────────────────────────────
 # LLM helpers
 # ──────────────────────────────────────────────────────────────
-def call_claude(bedrock_client, prompt: str, max_tokens: int = 400) -> str:
-    """Invoke Claude via AWS Bedrock."""
+def call_claude(
+    bedrock_client,
+    prompt: str,
+    max_tokens: int = 400,
+    max_retries: int = 6,
+) -> str:
+    """Invoke Claude via AWS Bedrock, retrying on throttling with backoff."""
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.5,
     })
-    response = bedrock_client.invoke_model(
-        modelId=CLAUDE_MODEL_ID,
-        contentType="application/json",
-        accept="application/json",
-        body=body,
-    )
-    result = json.loads(response["body"].read())
-    return result["content"][0]["text"]
+    for attempt in range(max_retries + 1):
+        try:
+            response = bedrock_client.invoke_model(
+                modelId=CLAUDE_MODEL_ID,
+                contentType="application/json",
+                accept="application/json",
+                body=body,
+            )
+            result = json.loads(response["body"].read())
+            return result["content"][0]["text"]
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ThrottlingException":
+                raise
+            if attempt == max_retries:
+                raise
+            # Exponential backoff with jitter, capped at 30s.
+            delay = min(30, (2 ** attempt)) + random.uniform(0, 1)
+            time.sleep(delay)
 
 
 def generate_coverage_summary(client, df: pd.DataFrame, unit_name: str) -> str:
@@ -553,60 +571,81 @@ if uploaded_file:
 
         summaries: dict[str, str] = {}
         total_steps = len(BUSINESS_UNITS) + 3  # +1 exec, +1 insights, +1 enrichment
+        # Small gap between calls so we don't burst past the account's
+        # Bedrock tokens-per-minute quota, which is what triggers
+        # ThrottlingException even though each call retries individually.
+        CALL_GAP_SECONDS = 3
 
-        # ── Business-unit summaries ──
-        st.subheader("📊 Coverage Area Summaries")
-        progress = st.progress(0, text="Starting analysis …")
+        try:
+            # ── Business-unit summaries ──
+            st.subheader("📊 Coverage Area Summaries")
+            progress = st.progress(0, text="Starting analysis …")
 
-        for idx, (unit_key, unit_label, _sources) in enumerate(BUSINESS_UNITS):
-            progress.progress(
-                idx / total_steps,
-                text=f"Summarizing {unit_label} …",
-            )
-            df = datasets[unit_key]
-            if df.empty:
-                summaries[unit_key] = "_No coverage data for this period._"
+            for idx, (unit_key, unit_label, _sources) in enumerate(BUSINESS_UNITS):
+                progress.progress(
+                    idx / total_steps,
+                    text=f"Summarizing {unit_label} …",
+                )
+                df = datasets[unit_key]
+                if df.empty:
+                    summaries[unit_key] = "_No coverage data for this period._"
+                    with st.expander(unit_label, expanded=False):
+                        st.markdown("_No coverage data for this period._")
+                    continue
+
+                if idx > 0:
+                    time.sleep(CALL_GAP_SECONDS)
+                summary = generate_coverage_summary(
+                    bedrock_runtime,
+                    df,
+                    unit_label.split(" ", 1)[1],  # drop emoji prefix
+                )
+                summaries[unit_key] = summary
                 with st.expander(unit_label, expanded=False):
-                    st.markdown("_No coverage data for this period._")
-                continue
+                    st.markdown(summary)
 
-            summary = generate_coverage_summary(
-                bedrock_runtime,
-                df,
-                unit_label.split(" ", 1)[1],  # drop emoji prefix
+            # ── Executive summary ──
+            progress.progress(
+                len(BUSINESS_UNITS) / total_steps,
+                text="Generating executive summary …",
             )
-            summaries[unit_key] = summary
-            with st.expander(unit_label, expanded=False):
-                st.markdown(summary)
+            st.subheader("📋 Executive Summary")
+            time.sleep(CALL_GAP_SECONDS)
+            exec_summary = generate_executive_summary(bedrock_runtime, summaries)
+            st.markdown(exec_summary)
 
-        # ── Executive summary ──
-        progress.progress(
-            len(BUSINESS_UNITS) / total_steps,
-            text="Generating executive summary …",
-        )
-        st.subheader("📋 Executive Summary")
-        exec_summary = generate_executive_summary(bedrock_runtime, summaries)
-        st.markdown(exec_summary)
+            # ── Overall insights (synthesized from section summaries) ──
+            progress.progress(
+                (len(BUSINESS_UNITS) + 1) / total_steps,
+                text="Generating overall insights …",
+            )
+            time.sleep(CALL_GAP_SECONDS)
+            insights_raw = generate_overall_insights(bedrock_runtime, summaries)
 
-        # ── Overall insights (synthesized from section summaries) ──
-        progress.progress(
-            (len(BUSINESS_UNITS) + 1) / total_steps,
-            text="Generating overall insights …",
-        )
-        insights_raw = generate_overall_insights(bedrock_runtime, summaries)
+            # ── Enrich insights with supporting coverage examples ──
+            progress.progress(
+                (len(BUSINESS_UNITS) + 2) / total_steps,
+                text="Matching insights to coverage examples …",
+            )
+            st.subheader("💡 Overall Insights")
+            time.sleep(CALL_GAP_SECONDS)
+            insights_enriched = enrich_insights_with_examples(
+                bedrock_runtime, insights_raw, datasets["all_coverage"]
+            )
+            st.markdown(insights_enriched)
 
-        # ── Enrich insights with supporting coverage examples ──
-        progress.progress(
-            (len(BUSINESS_UNITS) + 2) / total_steps,
-            text="Matching insights to coverage examples …",
-        )
-        st.subheader("💡 Overall Insights")
-        insights_enriched = enrich_insights_with_examples(
-            bedrock_runtime, insights_raw, datasets["all_coverage"]
-        )
-        st.markdown(insights_enriched)
-
-        progress.progress(1.0, text="✅ Analysis complete!")
+            progress.progress(1.0, text="✅ Analysis complete!")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ThrottlingException":
+                st.error(
+                    "AWS Bedrock is still rate-limiting requests after several "
+                    "retries. This usually means the account's Bedrock token/request "
+                    "quota for this model is too low for this workload — try again "
+                    "in a minute, or request a quota increase in the AWS console."
+                )
+            else:
+                st.error(f"AWS Bedrock request failed: {e}")
+            st.stop()
 
 else:
     st.info("Upload the GoDaddy IC Data workbook to get started.")
