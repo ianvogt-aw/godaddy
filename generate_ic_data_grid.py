@@ -954,6 +954,9 @@ HEADER_FONT = Font(name="Arial", bold=True, size=10, color="FFFFFF")
 HEADER_FILL = PatternFill("solid", fgColor="003366")
 HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
 CELL_FONT = Font(name="Arial", size=10)
+# Standard Excel hyperlink styling (blue, underlined) — applied to the URL column
+# so links are clickable by default instead of relying on Excel's own autodetection.
+HYPERLINK_FONT = Font(name="Arial", size=10, color="0563C1", underline="single")
 THIN_BORDER = Border(
     bottom=Side(style="thin", color="D0D0D0"),
 )
@@ -988,6 +991,24 @@ def _row_fill(row_data: list) -> PatternFill:
     return ORANGE_FILL if getattr(row_data, "is_t1", False) else PINK_FILL
 
 
+def _write_data_cell(ws, row_idx: int, col_idx: int, value, fill: PatternFill) -> None:
+    """Write one data cell with standard styling. The URL column additionally gets
+    a real hyperlink + blue/underlined font, so links are clickable by default
+    instead of depending on Excel's own (inconsistent) autodetection."""
+    # ws.cell(..., value=value) silently *skips* setting the value when value is
+    # None (its default-arg design can't tell "explicitly write None" from
+    # "caller didn't pass one") — assign .value directly instead.
+    cell = ws.cell(row=row_idx, column=col_idx)
+    cell.value = value
+    cell.border = THIN_BORDER
+    cell.fill = fill
+    if col_idx - 1 == URL_COL_IDX and isinstance(value, str) and value.startswith(("http://", "https://")):
+        cell.hyperlink = value
+        cell.font = HYPERLINK_FONT
+    else:
+        cell.font = CELL_FONT
+
+
 def write_tab(ws, rows: list[list]):
     """Write header + data rows to a worksheet with formatting."""
     # Header row
@@ -1003,14 +1024,7 @@ def write_tab(ws, rows: list[list]):
     for row_idx, row_data in enumerate(rows_sorted, start=2):
         fill = _row_fill(row_data)
         for col_idx, value in enumerate(row_data, start=1):
-            # ws.cell(..., value=value) silently *skips* setting the value when
-            # value is None (its default-arg design can't tell "explicitly write
-            # None" from "caller didn't pass one") — assign .value directly instead.
-            cell = ws.cell(row=row_idx, column=col_idx)
-            cell.value = value
-            cell.font = CELL_FONT
-            cell.border = THIN_BORDER
-            cell.fill = fill
+            _write_data_cell(ws, row_idx, col_idx, value, fill)
 
     # Column widths
     for col_letter, width in COL_WIDTHS.items():
@@ -1120,8 +1134,8 @@ def create_workbook(tab_data: dict[str, list[list]], output_path: str, bedrock_c
 def _row_sort_key(cells_info):
     """Group by data-label color (Orange -> Pink -> Yellow -> everything else),
     newest first within each group. cells_info is the list of (value, font, fill,
-    border, alignment, number_format) tuples captured for one row; Date is column
-    1, Time is column 2."""
+    border, alignment, number_format, hyperlink) tuples captured for one row; Date
+    is column 1, Time is column 2."""
     _, _, fill, *_ = cells_info[0]
     fg = fill.fgColor
     if fill.fill_type == "solid" and fg.type == "rgb" and fg.rgb == ORANGE_FILL_ARGB:
@@ -1150,14 +1164,17 @@ def resort_tab(ws):
     max_col = ws.max_column
     entries = [
         # cell.font/.fill/.border/.alignment return an immutable StyleProxy; copy()
-        # unwraps it into a real, reassignable style object.
-        [(c.value, copy(c.font), copy(c.fill), copy(c.border), copy(c.alignment), c.number_format) for c in row]
+        # unwraps it into a real, reassignable style object. c.hyperlink is captured
+        # too (see write_tab/_write_data_cell) — reassigning it to a cell.hyperlink
+        # setter automatically re-points its internal ref at the new coordinate, so
+        # a plain (value, font, ...) copy without it would silently drop the link.
+        [(c.value, copy(c.font), copy(c.fill), copy(c.border), copy(c.alignment), c.number_format, c.hyperlink) for c in row]
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=max_col)
     ]
     entries.sort(key=_row_sort_key)
 
     for row_idx, cells_info in enumerate(entries, start=2):
-        for col_idx, (value, font, fill, border, alignment, number_format) in enumerate(cells_info, start=1):
+        for col_idx, (value, font, fill, border, alignment, number_format, hyperlink) in enumerate(cells_info, start=1):
             # See the matching comment in write_tab: must assign .value directly,
             # not via ws.cell(..., value=value), or a None here silently leaves
             # whatever value that cell position held before the resort.
@@ -1168,6 +1185,7 @@ def resort_tab(ws):
             cell.border = border
             cell.alignment = alignment
             cell.number_format = number_format
+            cell.hyperlink = hyperlink
 
 
 def resort_all_tabs(wb):
@@ -1254,11 +1272,7 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
                 row_idx = start_row + offset
                 fill = _row_fill(row_data)
                 for col_idx, value in enumerate(row_data, start=1):
-                    cell = ws.cell(row=row_idx, column=col_idx)
-                    cell.value = value
-                    cell.font = CELL_FONT
-                    cell.border = THIN_BORDER
-                    cell.fill = fill
+                    _write_data_cell(ws, row_idx, col_idx, value, fill)
             print(f"  ✓ {tab_name}: wrote {len(new_rows)} row(s)")
         else:
             ws = wb.create_sheet(title=ws_name)
@@ -1276,20 +1290,21 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
 # MAIN PIPELINE
 # ============================================================================
 
-def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_full_text: bool = False, csv_lookup: dict | None = None) -> dict[str, list[list]]:
-    """Fetch mentions from all 18 streams and organize by tab."""
+def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_full_text: bool = False, csv_lookup: dict | None = None, streams: list[dict] | None = None) -> dict[str, list[list]]:
+    """Fetch mentions from `streams` (default: all 18) and organize by tab."""
+    streams = streams if streams is not None else STREAMS
     tab_data: dict[str, list[list]] = defaultdict(list)
     total_mentions = 0
     unmatched_person_mentions = 0
     flagged_count = 0
 
-    for i, stream in enumerate(STREAMS, start=1):
+    for i, stream in enumerate(streams, start=1):
         sid = stream["id"]
         label = stream["label"]
         tier = stream["tier"]
         tab = stream["tab"]
 
-        print(f"\n[{i}/{len(STREAMS)}] Fetching {tier} — {label} (ID {sid}) → {tab}")
+        print(f"\n[{i}/{len(streams)}] Fetching {tier} — {label} (ID {sid}) → {tab}")
 
         try:
             mentions = client.get_all_mentions_chunked(sid, after, before, chunk_days=1)
@@ -1346,6 +1361,11 @@ def main():
     parser.add_argument("--append-to", default=None, help="Path to existing workbook to append to")
     parser.add_argument("--token", default=None, help="Cision One API token (or set CISION_API_TOKEN env var)")
     parser.add_argument(
+        "--tab", action="append", default=None,
+        help="Only fetch stream(s) feeding this output tab (e.g. \"Brand Identity\") instead of "
+             "all 18. Repeatable to pull multiple tabs. Matches STREAMS[i]['tab'] exactly.",
+    )
+    parser.add_argument(
         "--fetch-full-text", action="store_true",
         help="For mentions flagged Yellow (\"GoDaddy\" not in Cision's excerpt), fetch the "
              "mention's own URL and re-check the full article text before giving up. Off by "
@@ -1374,6 +1394,14 @@ def main():
     after_iso = f"{args.after}T00:00:00.000Z"
     before_iso = f"{args.before}T23:59:59.000Z"
 
+    streams_to_fetch = STREAMS
+    if args.tab:
+        streams_to_fetch = [s for s in STREAMS if s["tab"] in args.tab]
+        if not streams_to_fetch:
+            available = sorted({s["tab"] for s in STREAMS})
+            print(f"Error: No streams match --tab {args.tab}. Available tabs: {', '.join(available)}")
+            sys.exit(1)
+
     bedrock_client = build_bedrock_client() if args.llm_review else None
     csv_lookup = load_cision_exports(args.cision_exports_dir)
 
@@ -1381,7 +1409,7 @@ def main():
     print("  GoDaddy IC Data Grid Generator")
     print("=" * 60)
     print(f"  Date range: {args.after} → {args.before}")
-    print(f"  Streams: {len(STREAMS)}")
+    print(f"  Streams: {len(streams_to_fetch)}" + (f" (filtered to tab: {', '.join(args.tab)})" if args.tab else ""))
     print(f"  Rate limit: ~10 req/min ({REQUEST_INTERVAL}s between requests)")
     print(f"  Mode: {'Append' if args.append_to else 'New workbook'}")
     print(f"  Full-text re-check for flagged mentions: {'On' if args.fetch_full_text else 'Off'}")
@@ -1390,7 +1418,7 @@ def main():
     print()
 
     client = CisionOneClient(api_token=token)
-    tab_data = fetch_all_streams(client, after_iso, before_iso, fetch_full_text=args.fetch_full_text, csv_lookup=csv_lookup)
+    tab_data = fetch_all_streams(client, after_iso, before_iso, fetch_full_text=args.fetch_full_text, csv_lookup=csv_lookup, streams=streams_to_fetch)
 
     if args.append_to:
         output_path = args.output or args.append_to
