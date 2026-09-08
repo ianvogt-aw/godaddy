@@ -31,8 +31,8 @@ Requirements:
 
     Bedrock review (--llm-review, on by default) needs AWS credentials configured
     (e.g. via `aws configure` or standard AWS env vars) with Bedrock access:
-        export BEDROCK_REGION="us-east-2"                                  # optional, this is the default
-        export BEDROCK_MODEL_ID="us.anthropic.claude-sonnet-4-20250514-v1:0"  # optional, this is the default
+        export BEDROCK_REGION="us-east-2"                    # optional, this is the default
+        export BEDROCK_MODEL_ID="us.anthropic.claude-sonnet-5"  # optional, this is the default
 
     Optional, only used by --fetch-full-text as upgrades over plain `requests`
     (both are skipped silently if absent):
@@ -674,7 +674,7 @@ def enrich_row_from_csv_export(row: list, csv_lookup: dict) -> None:
 # of it as possible to Claude to judge whether it's a legit GoDaddy mention.
 
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-2")
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5")
 
 # How much evidence text we'll both send to Claude and store in the Review
 # Evidence cell. Generous enough to cover nearly any news article in full.

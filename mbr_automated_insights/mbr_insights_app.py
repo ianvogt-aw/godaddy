@@ -320,19 +320,38 @@ def call_claude(
 
 def generate_coverage_summary(client, df: pd.DataFrame, unit_name: str) -> str:
     """Generate a BU-level coverage summary."""
-    coverage_data = df[["Date", "Title", "Hit Sentence"]].to_string(index=False)
+    # Cap rows and truncate long hit sentences — large sheets (700+ rows of
+    # full hit-sentence text) can otherwise blow past the model's input
+    # token limit and trigger a Bedrock ValidationException.
+    MAX_ROWS = 200
+    MAX_HIT_SENTENCE_CHARS = 300
+
+    sampled = len(df) > MAX_ROWS
+    sample_df = df.sample(MAX_ROWS, random_state=42).sort_values("Date") if sampled else df
+
+    coverage_df = sample_df[["Date", "Title", "Hit Sentence"]].copy()
+    coverage_df["Hit Sentence"] = (
+        coverage_df["Hit Sentence"].astype(str).str.slice(0, MAX_HIT_SENTENCE_CHARS)
+    )
+    coverage_data = coverage_df.to_string(index=False)
+
     min_date, max_date = df["Date"].min(), df["Date"].max()
     date_range = (
         f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}"
         if pd.notna(min_date) else "N/A"
+    )
+    sample_note = (
+        f"\n(Showing a representative sample of {MAX_ROWS} of {len(df)} articles below — "
+        "use the Total articles figure above, not a count of the rows shown, for any totals.)"
+        if sampled else ""
     )
     prompt = f"""You are analyzing media coverage data for the {unit_name} area of GoDaddy.
 
 Dataset: {unit_name}
 Total articles: {len(df)}
 Date range: {date_range}
-
-Here is the complete coverage data:
+{sample_note}
+Here is the coverage data:
 {coverage_data}
 
 Please provide a brief, concise summary (3-5 bullet points, ~100-150 words) that describes:
