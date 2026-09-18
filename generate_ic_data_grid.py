@@ -363,6 +363,40 @@ def map_language_code(code: str) -> str:
 
 
 # ============================================================================
+# HARDCODED FINANCE SOURCE ROUTING
+# ============================================================================
+# These outlets are financial-news sources whose GoDaddy coverage always belongs
+# on the Finance tab, regardless of which stream it was pulled from. Matched
+# mentions are routed straight to "Finance + Int." in fetch_all_streams, before
+# the LLM review step ever sees them. Finance + Int. is already in
+# NO_LLM_REVIEW_TABS (see LLM MENTION REVIEW section below), so once a row lands
+# there the LLM step never touches — and therefore never relocates — it back out.
+
+FINANCE_SOURCE_NAMES = {
+    "agbest", "agrowstar", "bored panda", "cmoney news", "line today",
+    "marketminute - kxlt", "the stock observer", "trading view", "trading view (in)",
+    "yahoo! finance",
+}
+
+# Domain matches also cover subdomains (e.g. it.investing.com, de.investing.com
+# all match "investing.com").
+FINANCE_SOURCE_DOMAINS = {
+    "tw.stock.yahoo.com", "zacks.com", "investing.com", "marketbeat.com",
+    "nasdaq.com", "themarketsdaily.com",
+}
+
+
+def is_hardcoded_finance_source(mention: dict) -> bool:
+    """True if a raw Cision mention's source name or URL domain matches one of
+    the hardcoded finance outlets above."""
+    name = (mention.get("source") or "").strip().lower()
+    if name in FINANCE_SOURCE_NAMES:
+        return True
+    domain = extract_domain(mention.get("url") or mention.get("internalLink") or "").strip().lower()
+    return any(domain == d or domain.endswith("." + d) for d in FINANCE_SOURCE_DOMAINS)
+
+
+# ============================================================================
 # FULL-ARTICLE FALLBACK (--fetch-full-text)
 # ============================================================================
 # Cision's excerpt is a single fixed snippet — if "GoDaddy" isn't in it, that
@@ -708,8 +742,9 @@ GoDaddy as registrar, host, DNS, WHOIS, SSL, email, payments, or security provid
 "GoDaddy website team", "GoDaddy Secret Manager".
 
 B - GoDaddy Brand/Company: GoDaddy is mentioned only at the company or brand level with no \
-concrete offering or service use case, and the evidence is not about research/data. \
-Examples: employee/executive mention, stock/investor/earnings coverage, GoDaddy named as \
+concrete offering or service use case, and the evidence is not about research/data and not \
+financial/stock-market coverage (see I). \
+Examples: employee/executive mention, GoDaddy named as \
 competitor, sponsorships, partnerships, general company references, GoDaddy quote not \
 tied to research output.
 
@@ -741,12 +776,20 @@ talent or a spokesperson in an advertising context (e.g. "Walton Goggins", \
 ad campaign, ad creative, or marketing stunt rather than the company or its products. \
 Classify as H regardless of other signals — commercial mentions are discarded.
 
+I - Finance-Related Content: The evidence is stock, investor, earnings, or financial-market \
+coverage of GoDaddy, with no specific GoDaddy product/offering discussed (that combination is \
+still A) and not GoDaddy's own research/data output (that's C). \
+Examples: GoDaddy's stock price/ticker movement, analyst ratings or price targets, investor \
+earnings calls or reports, GoDaddy included in a market-mover/watchlist/stock-screener roundup, \
+coverage from a financial-news or stock-market outlet framing GoDaddy purely as a ticker/equity.
+
 Strict decision rules:
 - Check for press release signals FIRST. If the source is clearly a press release, \
-classify as G regardless of A/B/C signals.
+classify as G regardless of A/B/C/I signals.
 - Check for commercial/ad signals SECOND. If the mention is about a GoDaddy commercial \
-or ad campaign, classify as H regardless of A/B/C signals.
+or ad campaign, classify as H regardless of A/B/C/I signals.
 - If both A and B signals appear, choose A.
+- If both A and I signals appear, choose A.
 - If both B and C signals appear and the mention is about research/survey/report/index/data, choose C.
 - Do NOT use A just because the article topic is domains, hosting, or websites. \
 GoDaddy itself must be the provider, tool, service, or platform in the evidence sentence.
@@ -754,8 +797,11 @@ GoDaddy itself must be the provider, tool, service, or platform in the evidence 
 - Do NOT use D if "GoDaddy" appears anywhere in the evidence text.
 - If the article is mainly about another company or topic, but the evidence says the \
 domain/hosting/certificate/platform is from GoDaddy, that is still A.
-- For stock, investor, earnings, or company-profile stories: if no specific GoDaddy offering \
-is named in the evidence, use B.
+- For stock, investor, earnings, or financial-market coverage (e.g. stock price moves, analyst \
+ratings, market-mover/watchlist roundups): if no specific GoDaddy offering is named in the \
+evidence, use I, not B.
+- For general company-profile stories with no specific GoDaddy offering and no financial-market \
+angle, use B.
 - For non-English text, "GoDaddy" usually still appears in Latin letters.
 
 Respond with ONLY valid JSON. No markdown fences, no explanation, no preamble:
@@ -837,7 +883,7 @@ def classify_mention_full_text(evidence: str, bedrock_client, model_id: str, url
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         result = json.loads(raw)
-        if result.get("classification") not in ("A", "B", "C", "D", "E", "F", "G", "H"):
+        if result.get("classification") not in ("A", "B", "C", "D", "E", "F", "G", "H", "I"):
             result["classification"] = "F"
         result["confidence"] = int(result.get("confidence", 50))
         return result
@@ -879,6 +925,7 @@ RELOCATE_TARGETS = {
     "A": "AGI (Product) + Int.",
     "B": "Brand + Int.",
     "C": "GDSBRL + Int.",
+    "I": "Finance + Int.",
 }
 
 # A Class A result only moves to AGI if it isn't already sitting in *some*
@@ -912,9 +959,9 @@ def _relocation_target(tab_name: str, classification: str) -> str | None:
 def review_and_relocate(tab_data: dict[str, list], bedrock_client, model_id: str) -> None:
     """Mutates tab_data in place. Per requirement: Orange (T1) rows are never
     reviewed or moved — they're left exactly where Cision put them for a human to
-    check manually. Pink (Non-T1) rows are LLM-reviewed; classifications A/B/C
-    relocate the row into the AGI/Brand/GDSBRL tab respectively, unless it's
-    already in an equivalent Product/Corporate tab (see _relocation_target).
+    check manually. Pink (Non-T1) rows are LLM-reviewed; classifications A/B/C/I
+    relocate the row into the AGI/Brand/GDSBRL/Finance tab respectively, unless
+    it's already in an equivalent Product/Corporate tab (see _relocation_target).
     D/E/F/G/H rows stay in their original tab. Skips NO_LLM_REVIEW_TABS entirely."""
     if bedrock_client is None:
         return
@@ -1257,7 +1304,7 @@ def append_to_workbook(tab_data: dict[str, list[list]], existing_path: str, outp
         if new_unique:
             new_by_tab[tab_name] = new_unique
 
-    # ── Pass 2: LLM-review Pink rows, relocating A/B/C classifications ──
+    # ── Pass 2: LLM-review Pink rows, relocating A/B/C/I classifications ──
     review_and_relocate(new_by_tab, bedrock_client, bedrock_model_id)
 
     # ── Pass 3: write everything, including any tab a relocation newly touched ──
@@ -1315,20 +1362,24 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_fu
         if stream.get("split_by_person"):
             matched = 0
             for m in mentions:
+                finance_override = is_hardcoded_finance_source(m)
                 person_tabs = {
                     PEOPLE_LOOKUP[kw.lower()]
                     for kw in (m.get("keywords") or [])
                     if kw.lower() in PEOPLE_LOOKUP
                 }
-                if not person_tabs:
+                if not finance_override and not person_tabs:
                     unmatched_person_mentions += 1
                     continue
                 row = mention_to_row(m, stream, fetch_full_text=fetch_full_text)
                 enrich_row_from_csv_export(row, csv_lookup)
                 if row.hit_sentence_flagged:
                     flagged_count += 1
-                for person_tab in person_tabs:
-                    tab_data[person_tab].append(row)
+                if finance_override:
+                    tab_data["Finance + Int."].append(row)
+                else:
+                    for person_tab in person_tabs:
+                        tab_data[person_tab].append(row)
                 matched += 1
             print(f"    ✓ {len(mentions)} mentions → routed {matched} to person tabs")
         else:
@@ -1336,7 +1387,9 @@ def fetch_all_streams(client: CisionOneClient, after: str, before: str, fetch_fu
             for row in rows:
                 enrich_row_from_csv_export(row, csv_lookup)
             flagged_count += sum(1 for r in rows if r.hit_sentence_flagged)
-            tab_data[tab].extend(rows)
+            for m, row in zip(mentions, rows):
+                dest_tab = "Finance + Int." if is_hardcoded_finance_source(m) else tab
+                tab_data[dest_tab].append(row)
             print(f"    ✓ {len(mentions)} mentions")
 
         total_mentions += len(mentions)
