@@ -375,7 +375,7 @@ def map_language_code(code: str) -> str:
 FINANCE_SOURCE_NAMES = {
     "agbest", "agrowstar", "bored panda", "cmoney news", "line today",
     "marketminute - kxlt", "the stock observer", "trading view", "trading view (in)",
-    "yahoo! finance",
+    "yahoo! finance", "marketnews", "american banking and market news",
 }
 
 # Domain matches also cover subdomains (e.g. it.investing.com, de.investing.com
