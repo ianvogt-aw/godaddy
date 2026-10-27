@@ -1026,7 +1026,8 @@ THIN_BORDER = Border(
 # Pink = new Non-T1 data to review. Yellow overrides both — it means the mention
 # review LLM step classified the row D (No GoDaddy mention), G (Press Release),
 # or H (Commercial/Ad), so it needs a human look before being kept or removed.
-# Red ("Removed") is a manual designation this script never applies and never
+# Red ("Removed") is applied automatically to press-release URLs (see
+# PRESS_RELEASE_URL_RE) and is otherwise a manual designation this script never
 # clears. NO_FILL is used to "age out" a row from Orange/Pink to White once it's
 # no longer new.
 ORANGE_FILL_ARGB = "FFFBE2D5"
@@ -1036,17 +1037,26 @@ YELLOW_FILL_ARGB = "FFFFFF00"
 ORANGE_FILL = PatternFill("solid", fgColor=ORANGE_FILL_ARGB)
 PINK_FILL = PatternFill("solid", fgColor=PINK_FILL_ARGB)
 YELLOW_FILL = PatternFill("solid", fgColor=YELLOW_FILL_ARGB)
+RED_FILL = PatternFill("solid", fgColor=RED_FILL_ARGB)
 NO_FILL = PatternFill(fill_type=None)
 
 # Mention-review classifications that mean "not a keeper" — see REVIEW_SYSTEM_PROMPT.
 YELLOW_CLASSIFICATIONS = {"D", "G", "H"}
 
 
+# A URL containing a "pr." token (e.g. pr.example.com, /pr.html, -pr.) or
+# "pressrelease" is a press release — auto-scrubbed Red (Removed).
+PRESS_RELEASE_URL_RE = re.compile(r"(?<![a-z0-9])pr\.|pressrelease", re.IGNORECASE)
+
+
 def _row_fill(row_data: list) -> PatternFill:
-    """Yellow once Review Classification lands on D/G/H (only ever set for Pink
-    rows — Orange rows are never reviewed, see review_and_relocate). Otherwise
+    """Red (Removed) when the URL looks like a press release (PRESS_RELEASE_URL_RE).
+    Otherwise Yellow once Review Classification lands on D/G/H (only ever set for
+    Pink rows — Orange rows are never reviewed, see review_and_relocate). Otherwise
     Orange for T1 rows, Pink for Non-T1 — row.is_t1 is the single source of truth
     shared with Custom Categories (see mention_to_row), so the two never disagree."""
+    if PRESS_RELEASE_URL_RE.search(row_data[URL_COL_IDX] or ""):
+        return RED_FILL
     if row_data[REVIEW_CLASSIFICATION_COL_IDX] in YELLOW_CLASSIFICATIONS:
         return YELLOW_FILL
     return ORANGE_FILL if getattr(row_data, "is_t1", False) else PINK_FILL
