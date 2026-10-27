@@ -209,14 +209,22 @@ class CisionOneClient:
             if elapsed < REQUEST_INTERVAL:
                 time.sleep(REQUEST_INTERVAL - elapsed)
             self._last_request_time = time.time()
-            resp = self.session.get(url, params=params)
-            if resp.status_code != 429:
+            try:
+                resp = self.session.get(url, params=params, timeout=120)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                wait = REQUEST_INTERVAL * (2 ** (attempt - 1))
+                print(f"    ⏳ Network error ({type(e).__name__}). Retry {attempt}/{MAX_RETRIES} — waiting {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            if resp.status_code != 429 and resp.status_code < 500:
                 return resp
             retry_after = resp.headers.get("Retry-After")
             wait = float(retry_after) if retry_after else REQUEST_INTERVAL * (2 ** (attempt - 1))
-            print(f"    ⏳ Rate-limited (429). Retry {attempt}/{MAX_RETRIES} — waiting {wait:.0f}s")
+            label = "Rate-limited (429)" if resp.status_code == 429 else f"Server error ({resp.status_code})"
+            print(f"    ⏳ {label}. Retry {attempt}/{MAX_RETRIES} — waiting {wait:.0f}s")
             time.sleep(wait)
         resp.raise_for_status()
+        return resp
 
     def get_mentions(self, stream_id, after, before, page=1, page_size=500):
         resp = self._throttled_get(
@@ -263,7 +271,13 @@ class CisionOneClient:
             window_end = min(window_start + chunk, end)
             w_after = window_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             w_before = window_end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            batch = self.get_all_mentions(stream_id, w_after, w_before, page_size=page_size)
+            try:
+                batch = self.get_all_mentions(stream_id, w_after, w_before, page_size=page_size)
+            except (requests.RequestException, ValueError) as e:
+                # Don't lose the whole stream over one bad day window
+                print(f"    ⚠️  WINDOW FAILED {w_after} → {w_before}: {e}\n"
+                      f"       Skipping this window — re-run for this date to fill the gap.")
+                batch = []
             all_mentions.extend(batch)
             window_start = window_end
         # Deduplicate
@@ -1194,10 +1208,26 @@ def _row_sort_key(cells_info):
     else:
         group = 3
 
-    date_val = cells_info[0][0]
-    time_val = cells_info[1][0]
-    date_ord = date_val.toordinal() if date_val else 0
-    time_secs = (time_val.hour * 3600 + time_val.minute * 60 + time_val.second) if time_val else 0
+    # Cells may hold real date/time objects or text (e.g. rows written as strings,
+    # or hand-edited cells), so coerce defensively; unparseable values sort last.
+    def _parse(val):
+        if isinstance(val, str):
+            val = val.strip()
+            if not val:
+                return None
+            try:
+                return dtparser.parse(val)
+            except (ValueError, OverflowError):
+                return None
+        return val
+
+    date_val = _parse(cells_info[0][0])
+    time_val = _parse(cells_info[1][0])
+    date_ord = date_val.toordinal() if hasattr(date_val, "toordinal") else 0
+    time_secs = (
+        time_val.hour * 3600 + time_val.minute * 60 + time_val.second
+        if hasattr(time_val, "hour") else 0
+    )
     return (group, -date_ord, -time_secs)
 
 
