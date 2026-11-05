@@ -306,7 +306,17 @@ def call_claude(
                 body=body,
             )
             result = json.loads(response["body"].read())
-            return result["content"][0]["text"]
+            text = "".join(
+                b.get("text", "") for b in result.get("content", [])
+                if b.get("type") == "text"
+            ).strip()
+            if not text:
+                raise RuntimeError(
+                    f"Model returned no text (stop_reason={result.get('stop_reason')}, "
+                    f"block types={[b.get('type') for b in result.get('content', [])]}). "
+                    "If stop_reason is 'max_tokens', raise max_tokens."
+                )
+            return text
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") != "ThrottlingException":
                 raise
