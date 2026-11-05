@@ -296,7 +296,6 @@ def call_claude(
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.5,
     })
     for attempt in range(max_retries + 1):
         try:
