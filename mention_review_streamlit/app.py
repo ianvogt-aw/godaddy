@@ -44,7 +44,7 @@ MELTWATER_API_BASE = "https://api.meltwater.com/v3"
 BEDROCK_REGION = st.secrets.get("BEDROCK_REGION", os.environ.get("BEDROCK_REGION", "us-east-2"))
 BEDROCK_MODEL_ID = st.secrets.get(
     "BEDROCK_MODEL_ID",
-    os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+    os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5"),
 )
 
 EXCLUDED_TABS = {"Legend", "Hist_Data", "Hist_Calc", "Hist_Stage"}
