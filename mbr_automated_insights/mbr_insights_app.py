@@ -374,7 +374,7 @@ GUIDELINES:
 - Keep the summary factual and focused on what the data shows.
 - Do not make up ANY information, numbers or figures.
 - Use only what is in the provided data to generate insights."""
-    return call_claude(client, prompt, max_tokens=300)
+    return call_claude(client, prompt, max_tokens=1500)
 
 
 def generate_executive_summary(client, summaries: dict[str, str]) -> str:
@@ -397,7 +397,7 @@ Please create a concise executive summary (4-6 bullet points, ~150-200 words) th
 - Provides specific coverage pieces generating and driving these insights
 
 Keep the summary factual and focused on what the data showed."""
-    return call_claude(client, prompt, max_tokens=400)
+    return call_claude(client, prompt, max_tokens=2000)
 
 
 def generate_overall_insights(client, summaries: dict[str, str]) -> str:
@@ -427,7 +427,7 @@ Each insight should:
 
 Do NOT simply repeat individual section summaries — your value is in
 connecting the dots between them."""
-    return call_claude(client, prompt, max_tokens=500)
+    return call_claude(client, prompt, max_tokens=2000)
 
 
 def enrich_insights_with_examples(
@@ -484,7 +484,7 @@ RULES:
 - Prefer articles spread across different dates when possible to show the
   trend or pattern described in the insight."""
 
-    return call_claude(client, prompt, max_tokens=1500)
+    return call_claude(client, prompt, max_tokens=4000)
 
 
 # ──────────────────────────────────────────────────────────────
