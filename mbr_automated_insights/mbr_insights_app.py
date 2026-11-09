@@ -295,6 +295,8 @@ def call_claude(
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
+        # Sonnet 5 may spend max_tokens on thinking; the budgets here are sized for output only.
+        "thinking": {"type": "disabled"},
         "messages": [{"role": "user", "content": prompt}],
     })
     for attempt in range(max_retries + 1):
